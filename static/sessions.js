@@ -276,17 +276,32 @@ async function newSession(flash){
   // default_model (from Settings) takes priority over the chat-header dropdown
   // value, which reflects the *previous* session's model. Fall back to the
   // dropdown value only when no default_model is configured.
-  const newModel=window._defaultModel||$('modelSelect').value;
-  const data=await api('/api/session/new',{method:'POST',body:JSON.stringify({model:newModel,workspace:inheritWs,profile:S.activeProfile||'default'})});
+  const modelSel=$('modelSelect');
+  const selectedDefaultModel=window._defaultModel||(modelSel&&modelSel.value)||'';
+  let defaultApplied=false;
+  if(window._defaultModel&&modelSel&&typeof _applyModelToDropdown==='function'){
+    defaultApplied=!!_applyModelToDropdown(window._defaultModel,modelSel,window._activeProvider||null);
+  }
+  const canQualify=!window._defaultModel||defaultApplied||(modelSel&&modelSel.value===selectedDefaultModel);
+  const newModelState=(canQualify&&typeof _modelStateForSelect==='function')
+    ? _modelStateForSelect(modelSel,selectedDefaultModel)
+    : {model:selectedDefaultModel,model_provider:null};
+  const data=await api('/api/session/new',{method:'POST',body:JSON.stringify({
+    model:newModelState.model,
+    model_provider:newModelState.model_provider||null,
+    workspace:inheritWs,
+    profile:S.activeProfile||'default',
+  })});
   S.session=data.session;S.messages=data.session.messages||[];
   S.lastUsage={...(data.session.last_usage||{})};
   if(flash)S.session._flash=true;
   localStorage.setItem('hermes-webui-session',S.session.session_id);
+  _setActiveSessionUrl(S.session.session_id);
   _setSessionViewedCount(S.session.session_id, S.session.message_count || 0);
   // Sync chat-header dropdown to the session's model so the UI reflects
   // the default model the server actually used (#872).
   if(S.session.model && S.session.model!==$('modelSelect').value && typeof _applyModelToDropdown==='function'){
-    _applyModelToDropdown(S.session.model,$('modelSelect'));
+    _applyModelToDropdown(S.session.model,$('modelSelect'),S.session.model_provider||null);
     if(typeof syncModelChip==='function') syncModelChip();
   }
   // Reset per-session visual state: a fresh chat is idle even if another
@@ -362,6 +377,7 @@ async function loadSession(sid){
   _setSessionViewedCount(S.session.session_id, Number(data.session.message_count || 0));
   _clearSessionCompletionUnread(S.session.session_id);
   localStorage.setItem('hermes-webui-session',S.session.session_id);
+  _setActiveSessionUrl(S.session.session_id);
 
   const activeStreamId=S.session.active_stream_id||null;
 
@@ -513,8 +529,10 @@ function _resolveSessionModelForDisplaySoon(sid){
     try{
       const data=await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=0&resolve_model=1`);
       const model=data&&data.session&&data.session.model;
+      const provider=data&&data.session&&data.session.model_provider;
       if(!model||!S.session||S.session.session_id!==sid) return;
       S.session.model=model;
+      S.session.model_provider=provider||null;
       S.session._modelResolutionDeferred=false;
       syncTopbar();
     }catch(_){
@@ -647,6 +665,41 @@ let _showAllProfiles = false;  // false = filter to active profile only
 let _sessionActionMenu = null;
 let _sessionActionAnchor = null;
 let _sessionActionSessionId = null;
+
+function _sessionIdFromLocation(){
+  if(typeof window==='undefined'||!window.location) return null;
+  const marker='/session/';
+  const path=window.location.pathname||'';
+  const idx=path.indexOf(marker);
+  if(idx>=0){
+    const raw=path.slice(idx+marker.length).split('/')[0];
+    if(raw){try{return decodeURIComponent(raw);}catch(_e){return raw;}}
+  }
+  try{
+    const qs=new URLSearchParams(window.location.search||'');
+    return qs.get('session')||null;
+  }catch(_e){return null;}
+}
+function _sessionUrlForSid(sid){
+  const encoded=encodeURIComponent(sid);
+  let base;
+  try{base=new URL(`session/${encoded}`, document.baseURI||window.location.origin+'/');}
+  catch(_e){base=new URL(`/session/${encoded}`, window.location.origin);}
+  try{
+    const current=new URL(window.location.href);
+    current.searchParams.delete('session');
+    base.search=current.searchParams.toString();
+    base.hash=current.hash;
+  }catch(_e){}
+  return base.pathname+base.search+base.hash;
+}
+function _setActiveSessionUrl(sid){
+  if(typeof window==='undefined'||!window.history||!sid) return;
+  const next=_sessionUrlForSid(sid);
+  if(next && next!==(window.location.pathname+window.location.search+window.location.hash)){
+    window.history.replaceState({session_id:sid},'',next);
+  }
+}
 
 // ── Batch select mode ──
 function toggleSessionSelectMode(){
@@ -860,7 +913,7 @@ function _openSessionActionMenu(session, anchorEl){
     async()=>{
       closeSessionActionMenu();
       try{
-        const res=await api('/api/session/new',{method:'POST',body:JSON.stringify({workspace:session.workspace,model:session.model})});
+        const res=await api('/api/session/new',{method:'POST',body:JSON.stringify({workspace:session.workspace,model:session.model,model_provider:session.model_provider||null})});
         if(res.session){
           await api('/api/session/rename',{method:'POST',body:JSON.stringify({session_id:res.session.session_id,title:(session.title||'Untitled')+' (copy)'})});
           await loadSession(res.session.session_id);
@@ -1211,11 +1264,54 @@ function _sessionTimeBucketLabel(timestampMs, nowMs) {
   return t('session_time_bucket_older');
 }
 
+function _sessionLineageKey(s, sessionIdsInList){
+  if(!s||!s.session_id) return null;
+  // If parent_session_id points to another session in the current list,
+  // this is a subagent child — don't collapse it into lineage (#494).
+  if(s.parent_session_id && sessionIdsInList && sessionIdsInList.has(s.parent_session_id)){
+    return null;
+  }
+  return s._lineage_root_id || s.lineage_root_id || s.parent_session_id || null;
+}
+
+function _sessionLineageContainsSession(s, sid){
+  if(!s||!sid) return false;
+  if(s.session_id===sid) return true;
+  if(!Array.isArray(s._lineage_segments)) return false;
+  return s._lineage_segments.some(seg=>seg&&seg.session_id===sid);
+}
+
+function _collapseSessionLineageForSidebar(sessions){
+  const result=[];
+  const sessionIdsInList=new Set((sessions||[]).map(s=>s.session_id));
+  const groups=new Map();
+  for(const s of sessions||[]){
+    const key=_sessionLineageKey(s, sessionIdsInList);
+    if(!key){result.push(s);continue;}
+    if(!groups.has(key)) groups.set(key,[]);
+    groups.get(key).push(s);
+  }
+  for(const items of groups.values()){
+    if(items.length<=1){result.push(items[0]);continue;}
+    const sorted=[...items].sort((a,b)=>_sessionTimestampMs(b)-_sessionTimestampMs(a));
+    const chosen=sorted[0];
+    result.push({...chosen,_lineage_collapsed_count:items.length,_lineage_segments:sorted});
+  }
+  return result;
+}
+
+function _activeSessionIdForSidebar(){
+  if(S.session&&S.session.session_id) return S.session.session_id;
+  if(typeof _sessionIdFromLocation==='function') return _sessionIdFromLocation();
+  return null;
+}
+
 function renderSessionListFromCache(){
   // Don't re-render while user is actively renaming a session (would destroy the input)
   if(_renamingSid) return;
   closeSessionActionMenu();
   const q=($('sessionSearch').value||'').toLowerCase();
+  const activeSidForSidebar=_activeSessionIdForSidebar();
   const titleMatches=q?_allSessions.filter(s=>(s.title||'Untitled').toLowerCase().includes(q)):_allSessions;
   // Merge content matches (deduped): content matches appended after title matches
   const titleIds=new Set(titleMatches.map(s=>s.session_id));
@@ -1224,7 +1320,7 @@ function renderSessionListFromCache(){
   // real once the first message is sent. The server already filters them, but this
   // guard ensures a brand-new active session doesn't flash into the list while
   // _allSessions is stale from a prior render (#1171).
-  const withMessages=allMatched.filter(s=>(s.message_count||0)>0 || (S.session&&s.session_id===S.session.session_id&&(S.session.message_count||0)>0));
+  const withMessages=allMatched.filter(s=>(s.message_count||0)>0 || (activeSidForSidebar&&s.session_id===activeSidForSidebar) || (S.session&&s.session_id===S.session.session_id&&(S.session.message_count||0)>0));
   // Filter by active profile (unless "All profiles" is toggled on)
   // Server backfills profile='default' for legacy sessions, so every session has a profile.
   // Show only sessions tagged to the active profile; 'All profiles' toggle overrides.
@@ -1232,7 +1328,25 @@ function renderSessionListFromCache(){
   // Filter by active project
   const projectFiltered=_activeProject?profileFiltered.filter(s=>s.project_id===_activeProject):profileFiltered;
   // Filter archived unless toggle is on
-  const sessions=_showArchived?projectFiltered:projectFiltered.filter(s=>!s.archived);
+  const sessionsRaw=_showArchived?projectFiltered:projectFiltered.filter(s=>!s.archived);
+  const sessions=_collapseSessionLineageForSidebar(sessionsRaw);
+  // Build parent→children map for subagent tree (#494).
+  // Only children whose parent exists in the current (post-collapse) list are grouped.
+  const _sessionIdsInList=new Set(sessions.map(s=>s.session_id));
+  const _parentChildrenMap=new Map();
+  const _topLevelSessions=[];
+  for(const s of sessions){
+    if(s.parent_session_id && _sessionIdsInList.has(s.parent_session_id)){
+      if(!_parentChildrenMap.has(s.parent_session_id)) _parentChildrenMap.set(s.parent_session_id,[]);
+      _parentChildrenMap.get(s.parent_session_id).push(s);
+    } else {
+      _topLevelSessions.push(s);
+    }
+  }
+  // Collapse state for subagent tree groups — persisted in localStorage (#494)
+  let _treeCollapsed={};
+  try{_treeCollapsed=JSON.parse(localStorage.getItem('hermes-tree-collapsed')||'{}');}catch(e){}
+  const _saveTreeCollapsed=()=>{try{localStorage.setItem('hermes-tree-collapsed',JSON.stringify(_treeCollapsed));}catch(e){}};
   const archivedCount=projectFiltered.filter(s=>s.archived).length;
   const list=$('sessionList');list.innerHTML='';
   // Batch select bar (when in select mode)
@@ -1324,7 +1438,7 @@ function renderSessionListFromCache(){
     empty.textContent='No sessions in this project yet.';
     list.appendChild(empty);
   }
-  const orderedSessions=[...sessions].sort((a,b)=>_sessionTimestampMs(b)-_sessionTimestampMs(a));
+  const orderedSessions=[..._topLevelSessions].sort((a,b)=>_sessionTimestampMs(b)-_sessionTimestampMs(a));
   // Separate pinned from unpinned
   const pinned=orderedSessions.filter(s=>s.pinned);
   const unpinned=orderedSessions.filter(s=>!s.pinned);
@@ -1370,7 +1484,47 @@ function renderSessionListFromCache(){
       _saveCollapsed();
     };
     wrapper.appendChild(hdr);
-    for(const s of g.items){ body.appendChild(_renderOneSession(s, Boolean(g.isPinned))); }
+    for(const s of g.items){
+      const parentEl=_renderOneSession(s, Boolean(g.isPinned));
+      body.appendChild(parentEl);
+      // Render subagent children as indented tree (#494)
+      const children=_parentChildrenMap.get(s.session_id);
+      if(children&&children.length){
+        parentEl.classList.add('session-parent');
+        const treeCaret=document.createElement('span');
+        treeCaret.className='session-tree-caret';
+        treeCaret.textContent='\u25B8'; // right-pointing triangle (collapsed)
+        treeCaret.title=t('subagent_children');
+        parentEl.querySelector('.session-title-row').prepend(treeCaret);
+        const childCount=children.length;
+        const childBadge=document.createElement('span');
+        childBadge.className='session-tree-badge';
+        childBadge.textContent=childCount;
+        childBadge.title=t('subagent_children');
+        parentEl.querySelector('.session-title-row').appendChild(childBadge);
+        const isCollapsed=_treeCollapsed[s.session_id]!==false; // collapsed by default
+        const childContainer=document.createElement('div');
+        childContainer.className='session-tree-children';
+        if(isCollapsed){childContainer.style.display='none';treeCaret.classList.add('collapsed');}
+        else{treeCaret.classList.remove('collapsed');treeCaret.textContent='\u25BE';}
+        const sortedChildren=[...children].sort((a,b)=>_sessionTimestampMs(b)-_sessionTimestampMs(a));
+        for(const child of sortedChildren){
+          const childEl=_renderOneSession(child, Boolean(g.isPinned));
+          childEl.classList.add('session-tree-child');
+          childContainer.appendChild(childEl);
+        }
+        body.appendChild(childContainer);
+        treeCaret.onclick=(e)=>{
+          e.stopPropagation();
+          const hidden=childContainer.style.display==='none';
+          childContainer.style.display=hidden?'':'none';
+          treeCaret.textContent=hidden?'\u25BE':'\u25B8';
+          treeCaret.classList.toggle('collapsed',!hidden);
+          _treeCollapsed[s.session_id]=!hidden;
+          _saveTreeCollapsed();
+        };
+      }
+    }
     wrapper.appendChild(body);
     list.appendChild(wrapper);
   }
@@ -1384,7 +1538,7 @@ function renderSessionListFromCache(){
   // Note: declared after the groups loop but available via function hoisting.
   function _renderOneSession(s, isPinnedGroup=false){
     const el=document.createElement('div');
-    const isActive=S.session&&s.session_id===S.session.session_id;
+    const isActive=_sessionLineageContainsSession(s,activeSidForSidebar);
     const isStreaming=_isSessionEffectivelyStreaming(s);
     _rememberRenderedStreamingState(s, isStreaming);
     _rememberRenderedSessionSnapshot(s);
@@ -1418,6 +1572,19 @@ function renderSessionListFromCache(){
       pinInd.className='session-pin-indicator';
       pinInd.innerHTML=ICONS.pin;
       titleRow.appendChild(pinInd);
+    }
+    // Parent session indicator for forked/branched sessions (#465)
+    if(s.parent_session_id){
+      const branchInd=document.createElement('span');
+      branchInd.className='session-branch-indicator';
+      branchInd.textContent='\u2482'; // ⑂
+      branchInd.title=(typeof t==='function'?t('forked_from'):'Forked from')+' '+s.parent_session_id;
+      branchInd.style.cursor='pointer';
+      branchInd.onclick=(e)=>{
+        e.stopPropagation();
+        if(typeof loadSession==='function') loadSession(s.parent_session_id);
+      };
+      titleRow.appendChild(branchInd);
     }
     const title=document.createElement('span');
     title.className='session-title';
@@ -1525,7 +1692,7 @@ function renderSessionListFromCache(){
       };
       inp.onkeydown=e2=>{
         if(e2.key==='Enter'){
-          if(e2.isComposing){return;}
+          if(window._isImeEnter&&window._isImeEnter(e2)){return;}
           e2.preventDefault();
           e2.stopPropagation();
           finish(true);
@@ -1567,13 +1734,39 @@ function renderSessionListFromCache(){
     // onclick/ondblclick are unreliable on touch devices (iPad Safari especially):
     // hover-triggered layout shifts, ghost clicks, and 300ms delay all break
     // single-tap navigation. pointerup fires immediately on both mouse & touch.
+    // Mouse clicks are instant; touch presses need a 300ms delay to distinguish
+    // a tap from a scroll-drag gesture on mobile.
+    // Drag detection (pointermove > 5px) cancels the pending tap on release.
     let _lastTapTime=0;
     let _tapTimer=null;
+    let _pointerDownX=0;
+    let _pointerDownY=0;
+    let _isDragging=false;
+    let _clearDragTimer=null;
+    el.onpointerdown=(e)=>{
+      if(e.pointerType==='mouse' && e.button!==0) return;
+      _pointerDownX=e.clientX;
+      _pointerDownY=e.clientY;
+      _isDragging=false;
+    };
+    el.onpointermove=(e)=>{
+      if(_isDragging) return;
+      const dx=Math.abs(e.clientX-_pointerDownX);
+      const dy=Math.abs(e.clientY-_pointerDownY);
+      if(dx>5||dy>5){
+        _isDragging=true;
+        el.classList.add('dragging');
+        // Cancel any pending drag-clear so we don't flash hover mid-drag
+        if(_clearDragTimer){clearTimeout(_clearDragTimer);_clearDragTimer=null;}
+      }
+    };
     el.onpointerup=(e)=>{
       if(e.pointerType==='mouse' && e.button!==0) return;  // ignore right/middle click
       if(_renamingSid) return;
       if(actions.contains(e.target)) return;
       if(_sessionSelectMode){e.stopPropagation();toggleSessionSelect(s.session_id);return;}
+      // If the pointer moved enough to be a drag, cancel any pending tap
+      if(_isDragging){clearTimeout(_tapTimer);_tapTimer=null;_lastTapTime=0;_clearDragTimer=setTimeout(()=>{el.classList.remove('dragging');_clearDragTimer=null;},50);return;}
       const now=Date.now();
       if(now-_lastTapTime<350){
         // Double-tap: rename
@@ -1585,8 +1778,10 @@ function renderSessionListFromCache(){
       }
       _lastTapTime=now;
       // Single tap: wait to ensure it's not the first of a double-tap,
-      // then navigate
+      // then navigate. Mouse is instant; touch needs delay to suppress
+      // accidental navigation during scroll-drag lifts.
       clearTimeout(_tapTimer);
+      const delay=e.pointerType==='mouse'?0:300;
       _tapTimer=setTimeout(async()=>{
         _tapTimer=null;
         _lastTapTime=0;
@@ -1599,10 +1794,34 @@ function renderSessionListFromCache(){
         }
         await loadSession(s.session_id);renderSessionListFromCache();
         if(typeof closeMobileSidebar==='function')closeMobileSidebar();
-      }, 300);
+      }, delay);
     };
     return el;
   }
+}
+
+async function _handleActiveSessionStorageEvent(e){
+  if(!e || e.key !== 'hermes-webui-session') return;
+  // Do not treat localStorage as a global active-session bus. Each tab owns its
+  // active conversation via its URL (/session/<id>), so another tab switching
+  // sessions must not force this tab to navigate away from an in-flight turn.
+  if(typeof renderSessionListFromCache==='function') renderSessionListFromCache();
+}
+
+if(typeof window!=='undefined'){
+  window.addEventListener('storage', (e) => { void _handleActiveSessionStorageEvent(e); });
+  window.addEventListener('popstate', () => {
+    const sid=(typeof _sessionIdFromLocation==='function')?_sessionIdFromLocation():null;
+    if(!sid || (S.session && S.session.session_id===sid)) return;
+    // Refuse to switch sessions mid-stream — same UX guard the storage-event
+    // handler had. A user mid-turn who hits browser Back should NOT lose the
+    // active stream. They can hit Back again once the turn ends.
+    if(S.busy){
+      if(typeof showToast==='function') showToast('Finish the current turn before switching sessions.',3000);
+      return;
+    }
+    void loadSession(sid);
+  });
 }
 
 async function deleteSession(sid){
@@ -1767,7 +1986,7 @@ function _startProjectCreate(bar, addBtn){
   };
   inp.onkeydown=(e)=>{
     if(e.key==='Enter'){
-      if(e.isComposing){return;}
+      if(window._isImeEnter&&window._isImeEnter(e)){return;}
       e.preventDefault();
       finish(true);
     }
@@ -1795,7 +2014,7 @@ function _startProjectRename(proj, chip){
   };
   inp.onkeydown=(e)=>{
     if(e.key==='Enter'){
-      if(e.isComposing){return;}
+      if(window._isImeEnter&&window._isImeEnter(e)){return;}
       e.preventDefault();
       finish(true);
     }

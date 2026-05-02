@@ -51,6 +51,45 @@ function _setCompressionSessionLock(sid){
 }
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
+/**
+ * Render fenced code blocks inside user messages.
+ * Extracts ```…``` fences, replaces them with placeholders,
+ * escapes remaining text as plain HTML, then restores code blocks
+ * with the same <pre><code> pipeline used by renderMd().
+ * All non-fenced text stays escaped (no bold/italic/link interpretation).
+ */
+function _renderUserFencedBlocks(text){
+  const stash=[];
+  let s=String(text||'');
+  // Extract fenced code blocks → stash, replace with null-token placeholder
+  // CommonMark line-anchored fence (fixes #1438): inner ``` inside content no longer truncates the block.
+  s=s.replace(/(^|\n)[ ]{0,3}```([a-zA-Z0-9_+-]*)\n(?:([\s\S]*?)\n)?[ ]{0,3}```(?=\n|$)/g,(_,lead,lang,code)=>{
+    lang=(lang||'').trim().toLowerCase();
+    code=code||'';
+    // Remove one trailing newline if present (the fence consumes its own)
+    if(code.endsWith('\n')) code=code.slice(0,-1);
+    const h=lang?`<div class="pre-header">${esc(lang)}</div>`:'';
+    const langAttr=lang?` class="language-${esc(lang)}"`:'';
+    if(lang==='diff'||lang==='patch'){
+      const colored=esc(code).split('\n').map(line=>{
+        if(line.startsWith('@@')) return `<span class="diff-line diff-hunk">${line}</span>`;
+        if(line.startsWith('+')) return `<span class="diff-line diff-plus">${line}</span>`;
+        if(line.startsWith('-')) return `<span class="diff-line diff-minus">${line}</span>`;
+        return `<span class="diff-line">${line}</span>`;
+      }).join('\n');
+      stash.push(`${h}<pre class="diff-block"><code${langAttr}>${colored}</code></pre>`);
+    } else {
+      stash.push(`${h}<pre><code${langAttr}>${esc(code)}</code></pre>`);
+    }
+    return lead+'\x00UF'+(stash.length-1)+'\x00';
+  });
+  // Escape remaining plain text and convert newlines to <br>
+  s=esc(s).replace(/\n/g,'<br>');
+  // Restore stashed code blocks
+  s=s.replace(/\x00UF(\d+)\x00/g,(_,i)=>stash[+i]);
+  return s;
+}
+
 /* ── Image lightbox — click any .msg-media-img to enlarge ─────────────────── */
 function _openImgLightbox(src, alt) {
   const lb = document.createElement('div');
@@ -188,20 +227,95 @@ setTimeout(_initMediaPlaybackObserver,0);
 // Dynamic model labels -- populated by populateModelDropdown(), fallback to static map
 let _dynamicModelLabels={};
 window._configuredModelBadges=window._configuredModelBadges||{};
+const MODEL_STATE_KEY='hermes-webui-model-state';
 
 // ── Smart model resolver ────────────────────────────────────────────────────
 // Finds the best matching option value in a <select> for a given model ID.
 // Handles mismatches like 'claude-sonnet-4-6' vs 'anthropic/claude-sonnet-4.6'.
-// Returns the matched option's value (already in the list), or null if no match.
-function _findModelInDropdown(modelId, sel){
+// When a preferred provider is supplied, duplicate normalized IDs prefer that
+// provider's option so Settings/profile rehydration doesn't snap back to the
+// first colliding entry.
+function _getOptionProviderId(opt){
+  if(!opt) return '';
+  const group=opt.parentElement;
+  if(group && group.tagName==='OPTGROUP' && group.dataset && group.dataset.provider){
+    return group.dataset.provider;
+  }
+  const value=String(opt.value||'');
+  if(value.startsWith('@') && value.includes(':')) return value.slice(1,value.lastIndexOf(':'));
+  return '';
+}
+function _providerFromModelValue(modelId){
+  const value=String(modelId||'').trim();
+  if(value.startsWith('@')&&value.includes(':')) return value.slice(1,value.lastIndexOf(':'));
+  return '';
+}
+function _modelStateForSelect(sel, modelId){
+  const value=String(modelId||'').trim();
+  if(!value) return {model:'',model_provider:null};
+  const explicitProvider=_providerFromModelValue(value);
+  if(explicitProvider) return {model:value,model_provider:explicitProvider};
+  const opt=sel&&sel.selectedOptions&&sel.selectedOptions[0];
+  const provider=String(_getOptionProviderId(opt)||'').trim();
+  return {model:value,model_provider:(provider&&provider!=='default')?provider:null};
+}
+function _providerQualifiedModelValueForSelect(sel, modelId){
+  return _modelStateForSelect(sel,modelId).model;
+}
+function _readPersistedModelState(){
+  try{
+    const raw=localStorage.getItem(MODEL_STATE_KEY);
+    if(raw){
+      const parsed=JSON.parse(raw);
+      if(parsed&&parsed.model){
+        return {
+          model:String(parsed.model||''),
+          model_provider:parsed.model_provider?String(parsed.model_provider):(_providerFromModelValue(parsed.model)||null),
+        };
+      }
+    }
+  }catch(_){}
+  const legacy=localStorage.getItem('hermes-webui-model');
+  if(!legacy) return null;
+  return {model:legacy,model_provider:_providerFromModelValue(legacy)||null};
+}
+function _writePersistedModelState(model, modelProvider){
+  const value=String(model||'').trim();
+  const provider=modelProvider?String(modelProvider).trim():(_providerFromModelValue(value)||null);
+  if(!value){
+    localStorage.removeItem('hermes-webui-model');
+    localStorage.removeItem(MODEL_STATE_KEY);
+    return;
+  }
+  localStorage.setItem('hermes-webui-model', value);
+  try{
+    localStorage.setItem(MODEL_STATE_KEY, JSON.stringify({model:value,model_provider:provider||null}));
+  }catch(_){}
+}
+function _clearPersistedModelState(){
+  localStorage.removeItem('hermes-webui-model');
+  localStorage.removeItem(MODEL_STATE_KEY);
+}
+function _findModelInDropdown(modelId, sel, preferredProviderId){
   if(!modelId||!sel) return null;
-  const opts=Array.from(sel.options).map(o=>o.value);
-  // 1. Exact match
-  if(opts.includes(modelId)) return modelId;
-  // 2. Normalize: lowercase, strip namespace prefix, replace hyphens→dots
-  // Also strip @provider: prefix from deduplicated model IDs (#1228).
+  const options=Array.from(sel.options);
+  const opts=options.map(o=>o.value);
+  // 1. Normalize: lowercase, strip namespace prefix, replace hyphens→dots.
+  // Also strip @provider: prefix from deduplicated model IDs (#1228, #1313).
   const norm=s=>s.toLowerCase().replace(/^[^/]+\//,'').replace(/^@([^:]+:)+/,'').replace(/-/g,'.');
   const target=norm(modelId);
+  let explicitProvider='';
+  const rawModel=String(modelId||'');
+  if(rawModel.startsWith('@')&&rawModel.includes(':')){
+    explicitProvider=rawModel.slice(1,rawModel.lastIndexOf(':'));
+  }
+  const preferred=String(preferredProviderId||explicitProvider||'').toLowerCase();
+  if(preferred){
+    const providerMatch=options.find(o=>norm(o.value)===target && _getOptionProviderId(o).toLowerCase()===preferred);
+    if(providerMatch) return providerMatch.value;
+  }
+  // 2. Exact match
+  if(opts.includes(modelId)) return modelId;
   const exact=opts.find(o=>norm(o)===target);
   if(exact) return exact;
   // 3. Prefix/substring: require the candidate to start with the FULL normalized target
@@ -217,9 +331,9 @@ function _findModelInDropdown(modelId, sel){
 
 // Set the model picker to the best match for modelId.
 // Returns the resolved value that was actually set, or null if nothing matched.
-function _applyModelToDropdown(modelId, sel){
+function _applyModelToDropdown(modelId, sel, preferredProviderId){
   if(!modelId||!sel) return null;
-  const resolved=_findModelInDropdown(modelId,sel);
+  const resolved=_findModelInDropdown(modelId,sel,preferredProviderId);
   if(resolved){
     sel.value=resolved;
     if(sel.id==='modelSelect' && typeof syncModelChip==='function') syncModelChip();
@@ -232,7 +346,7 @@ async function populateModelDropdown(){
   const sel=$('modelSelect');
   if(!sel) return;
   try{
-    const _modelsRes=await fetch(new URL('api/models',location.href).href,{credentials:'include'});
+    const _modelsRes=await fetch(new URL('api/models',document.baseURI||location.href).href,{credentials:'include'});
     if(_redirectIfUnauth(_modelsRes)) return;
     const data=await _modelsRes.json();
     if(!data.groups||!data.groups.length) return; // keep HTML defaults
@@ -259,8 +373,8 @@ async function populateModelDropdown(){
       sel.appendChild(og);
     }
     // Set default model from server if no localStorage preference
-    if(data.default_model && !localStorage.getItem('hermes-webui-model')){
-      _applyModelToDropdown(data.default_model, sel);
+    if(data.default_model && !(typeof _readPersistedModelState==='function'&&_readPersistedModelState()) && !localStorage.getItem('hermes-webui-model')){
+      _applyModelToDropdown(data.default_model, sel, data.active_provider||null);
     }
     if(typeof syncModelChip==='function') syncModelChip();
     // Kick off a background live-model fetch for the active provider.
@@ -312,7 +426,7 @@ function _addLiveModelsToSelect(provider, models, sel){
   const existingNorm=new Set([...sel.options].map(o=>_normId(o.value)));
   let added=0;
   const _ap=(window._activeProvider||'').toLowerCase();
-  const _isPortalFetch=_ap && _ap!=='openrouter' && _ap!=='custom' && provider===_ap;
+  const _isPortalFetch=_ap && _ap!=='openrouter' && _ap!=='custom' && _ap!=='openai-codex' && provider===_ap;
   for(const m of models){
     let mid=m.id;
     if(_isPortalFetch && !mid.startsWith('@')){
@@ -328,13 +442,14 @@ function _addLiveModelsToSelect(provider, models, sel){
     _dynamicModelLabels[mid]=m.label||m.id;
     added++;
   }
-  if(added>0 && currentVal) _applyModelToDropdown(currentVal, sel);
+  const currentProvider=(S.session&&S.session.model_provider)||null;
+  if(added>0 && currentVal) _applyModelToDropdown(currentVal, sel, currentProvider);
   // After live models are added, re-apply the session's model in case it was
   // absent from the static list and syncTopbar() fired before the live fetch
   // completed (#1169). This ensures the session model wins over any premature
   // fallback that may have set sel.value to the first available option.
   if(S.session && S.session.model && sel.id==='modelSelect'){
-    const reapplied=_applyModelToDropdown(S.session.model, sel);
+    const reapplied=_applyModelToDropdown(S.session.model, sel, S.session.model_provider||null);
     if(reapplied && typeof syncModelChip==='function') syncModelChip();
   }
   return added;
@@ -350,7 +465,7 @@ async function _fetchLiveModels(provider, sel){
   }
   _liveModelFetchPending.add(provider);
   try{
-    const url=new URL('api/models/live',location.href);
+    const url=new URL('api/models/live',document.baseURI||location.href);
     url.searchParams.set('provider',provider);
     const _liveRes=await fetch(url.href,{credentials:'include'});
     if(_redirectIfUnauth(_liveRes)) return;
@@ -410,41 +525,59 @@ function _normalizeConfiguredModelKey(modelId){
   return s.replace(/-/g,'.');
 }
 
-function _getConfiguredModelBadge(modelId,badgeMap){
+function _getConfiguredModelBadge(modelId,badgeMap,providerId){
   const map=badgeMap||window._configuredModelBadges||{};
   if(!modelId||!map) return null;
-  if(map[modelId]) return map[modelId];
+  const provider=String(providerId||'').toLowerCase();
+  const exact=map[modelId];
+  if(exact && (!provider || !exact.provider || String(exact.provider).toLowerCase()===provider)) return exact;
   const targetNorm=_normalizeConfiguredModelKey(modelId);
+  const matches=[];
   for(const [candidate,badge] of Object.entries(map)){
-    if(_normalizeConfiguredModelKey(candidate)===targetNorm) return badge;
+    if(_normalizeConfiguredModelKey(candidate)===targetNorm) matches.push(badge);
   }
-  return null;
+  if(!matches.length) return null;
+  if(provider){
+    const providerMatch=matches.find(badge=>String(badge&&badge.provider||'').toLowerCase()===provider);
+    if(providerMatch) return providerMatch;
+    return matches.length===1 ? matches[0] : null;
+  }
+  return matches[0];
 }
 
 function syncModelChip(){
   const sel=$('modelSelect');
   const chip=$('composerModelChip');
   const label=$('composerModelLabel');
+  const mobileLabel=$('composerMobileModelLabel');
+  const mobileAction=$('composerMobileModelAction');
   const dd=$('composerModelDropdown');
   if(!sel||!chip||!label) return;
   // Don't show a model label until boot has finished loading to prevent flash of wrong default
   if(!S._bootReady){
     label.textContent='';
+    if(mobileLabel) mobileLabel.textContent='';
     chip.title='Conversation model';
     return;
   }
   const opt=_selectedModelOption();
-  label.textContent=opt?opt.textContent:getModelLabel(sel.value||'');
+  const text=opt?opt.textContent:getModelLabel(sel.value||'');
+  label.textContent=text;
+  if(mobileLabel) mobileLabel.textContent=text;
   chip.title=sel.value||'Conversation model';
   chip.classList.toggle('active',!!(dd&&dd.classList.contains('open')));
+  if(mobileAction) mobileAction.classList.toggle('active',!!(dd&&dd.classList.contains('open')));
 }
 
 function _positionModelDropdown(){
   const dd=$('composerModelDropdown');
   const chip=$('composerModelChip');
+  const mobileAction=$('composerMobileModelAction');
   const footer=document.querySelector('.composer-footer');
   if(!dd||!chip||!footer) return;
-  const chipRect=chip.getBoundingClientRect();
+  const panel=$('composerMobileConfigPanel');
+  const anchor=(panel&&panel.classList.contains('open')&&mobileAction)?mobileAction:chip;
+  const chipRect=anchor.getBoundingClientRect();
   const footerRect=footer.getBoundingClientRect();
   let left=chipRect.left-footerRect.left;
   const maxLeft=Math.max(0, footer.clientWidth-dd.offsetWidth);
@@ -461,13 +594,26 @@ function renderModelDropdown(){
   const _badgeMap=window._configuredModelBadges||{};
   for(const child of Array.from(sel.children)){
     if(child.tagName==='OPTGROUP'){
+      const providerId=child.dataset&&child.dataset.provider?child.dataset.provider:'';
       for(const opt of Array.from(child.children)){
-        _modelData.push({value:opt.value,name:esc(opt.textContent||getModelLabel(opt.value)),id:esc(opt.value),group:child.label||'',badge:_getConfiguredModelBadge(opt.value,_badgeMap)});
+        _modelData.push({value:opt.value,name:esc(opt.textContent||getModelLabel(opt.value)),id:esc(opt.value),group:child.label||'',badge:_getConfiguredModelBadge(opt.value,_badgeMap,providerId)});
       }
     }
     if(child.tagName==='OPTION'){
       _modelData.push({value:child.value,name:esc(child.textContent||getModelLabel(child.value)),id:esc(child.value),group:'',badge:_getConfiguredModelBadge(child.value,_badgeMap)});
     }
+  }
+  const _existingConfiguredKeys=new Set(_modelData.map(existing=>_normalizeConfiguredModelKey(existing.value)));
+  for(const [modelId,badge] of Object.entries(_badgeMap)){
+    if(_existingConfiguredKeys.has(_normalizeConfiguredModelKey(modelId))) continue;
+    _modelData.push({
+      value:modelId,
+      name:esc(getModelLabel(modelId)),
+      id:esc(modelId),
+      group:'',
+      badge,
+    });
+    _existingConfiguredKeys.add(_normalizeConfiguredModelKey(modelId));
   }
   // Create search input FIRST before filterModels definition
   const _scopeNote=document.createElement('div');
@@ -487,6 +633,15 @@ function renderModelDropdown(){
   _custRow.innerHTML=`<input class="model-custom-input" type="text" placeholder="${esc(t('model_custom_placeholder')||'e.g. openai/gpt-5.4')}" spellcheck="false" autocomplete="off"><button class="model-custom-btn" title="Use this model">${li('plus',12)}</button>`;
   const _ci=_custRow.querySelector('.model-custom-input');
   const _cb=_custRow.querySelector('.model-custom-btn');
+  const _configuredRank=(badge)=>{
+    if(!badge) return Number.POSITIVE_INFINITY;
+    if(badge.role==='primary') return 0;
+    if(badge.role==='fallback'){
+      const m=String(badge.label||'').match(/fallback\s+(\d+)/i);
+      return m?Number(m[1]):999;
+    }
+    return 500;
+  };
   // Filter function (defined AFTER _searchRow and _cust* are created)
   const _filterModels=(term)=>{
     term=term.trim().toLowerCase();
@@ -498,6 +653,16 @@ function renderModelDropdown(){
         found.add(m.value);
       }
     }
+    const matches=(m)=>!term||found.has(m.value);
+    const configuredModels=_modelData
+      .filter(m=>m.badge&&matches(m))
+      .sort((a,b)=>{
+        const configuredRankA=_configuredRank(a.badge);
+        const configuredRankB=_configuredRank(b.badge);
+        if(configuredRankA!==configuredRankB) return configuredRankA-configuredRankB;
+        return a.name.localeCompare(b.name);
+      });
+    const configuredIds=new Set(configuredModels.map(m=>m.value));
     // Clear and rebuild
     dd.innerHTML='';
     // Add search and custom elements first (CRITICAL: must be before models)
@@ -505,17 +670,12 @@ function renderModelDropdown(){
     dd.appendChild(_searchRow);
     dd.appendChild(_custSep);
     dd.appendChild(_custRow);
-    // Add models matching filter
-    let _lastGroup=null;
-    for(const m of _modelData){
-      if(!term||found.has(m.value)){
-        if(m.group&&m.group!==_lastGroup){
-          const heading=document.createElement('div');
-          heading.className='model-group';
-          heading.textContent=m.group;
-          dd.appendChild(heading);
-          _lastGroup=m.group;
-        }
+    if(configuredModels.length){
+      const configuredHeading=document.createElement('div');
+      configuredHeading.className='model-group';
+      configuredHeading.textContent=t('model_group_configured')||'Configured';
+      dd.appendChild(configuredHeading);
+      for(const m of configuredModels){
         const row=document.createElement('div');
         row.className='model-opt'+(m.value===sel.value?' active':'');
         const badgeHtml=m.badge?`<span class="model-opt-badge model-opt-badge--${esc(m.badge.role||'configured')}">${esc(m.badge.label||'Configured')}</span>`:'';
@@ -523,6 +683,24 @@ function renderModelDropdown(){
         row.onclick=()=>selectModelFromDropdown(m.value);
         dd.appendChild(row);
       }
+    }
+    // Add remaining models matching filter
+    let _lastGroup=null;
+    for(const m of _modelData){
+      if(configuredIds.has(m.value)||!matches(m)) continue;
+      if(m.group&&m.group!==_lastGroup){
+        const heading=document.createElement('div');
+        heading.className='model-group';
+        heading.textContent=m.group;
+        dd.appendChild(heading);
+        _lastGroup=m.group;
+      }
+      const row=document.createElement('div');
+      row.className='model-opt'+(m.value===sel.value?' active':'');
+      const badgeHtml=m.badge?`<span class="model-opt-badge model-opt-badge--${esc(m.badge.role||'configured')}">${esc(m.badge.label||'Configured')}</span>`:'';
+      row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${m.name}</span>${badgeHtml}</div><span class="model-opt-id">${m.id}</span>`;
+      row.onclick=()=>selectModelFromDropdown(m.value);
+      dd.appendChild(row);
     }
     // Show "No results" if filtered and nothing matched
     if(term&&found.size===0){
@@ -588,21 +766,30 @@ function toggleModelDropdown(){
   if(typeof closeProfileDropdown==='function') closeProfileDropdown();
   if(typeof closeWsDropdown==='function') closeWsDropdown();
   if(typeof closeReasoningDropdown==='function') closeReasoningDropdown();
+  if(typeof closeToolsetsDropdown==='function') closeToolsetsDropdown();
   renderModelDropdown();
   dd.classList.add('open');
   _positionModelDropdown();
   chip.classList.add('active');
+  const mobileAction=$('composerMobileModelAction');
+  if(mobileAction) mobileAction.classList.add('active');
 }
 
 function closeModelDropdown(){
   const dd=$('composerModelDropdown');
   const chip=$('composerModelChip');
+  const mobileAction=$('composerMobileModelAction');
   if(dd) dd.classList.remove('open');
   if(chip) chip.classList.remove('active');
+  if(mobileAction) mobileAction.classList.remove('active');
 }
 
 document.addEventListener('click',e=>{
-  if(!e.target.closest('#composerModelChip') && !e.target.closest('#composerModelDropdown')) closeModelDropdown();
+  if(
+    !e.target.closest('#composerModelChip') &&
+    !e.target.closest('#composerMobileModelAction') &&
+    !e.target.closest('#composerModelDropdown')
+  ) closeModelDropdown();
 });
 window.addEventListener('resize',()=>{
   const dd=$('composerModelDropdown');
@@ -634,14 +821,20 @@ function _applyReasoningChip(eff){
   const wrap=$('composerReasoningWrap');
   const label=$('composerReasoningLabel');
   const chip=$('composerReasoningChip');
+  const mobileLabel=$('composerMobileReasoningLabel');
+  const mobileAction=$('composerMobileReasoningAction');
   if(!wrap||!label) return;
   wrap.style.display='';
-  label.textContent=_formatReasoningEffortLabel(effort);
+  if(mobileAction) mobileAction.style.display='';
+  const text=_formatReasoningEffortLabel(effort);
+  label.textContent=text;
+  if(mobileLabel) mobileLabel.textContent=text;
   if(chip){
     const inactive=!effort||effort==='none';
     chip.classList.toggle('inactive',inactive);
-    chip.title='Reasoning effort: '+_formatReasoningEffortLabel(effort);
+    chip.title='Reasoning effort: '+text;
   }
+  if(mobileAction) mobileAction.classList.toggle('inactive',!effort||effort==='none');
   _highlightReasoningOption(effort);
 }
 
@@ -673,18 +866,24 @@ function toggleReasoningDropdown(){
   if(typeof closeProfileDropdown==='function') closeProfileDropdown();
   if(typeof closeWsDropdown==='function') closeWsDropdown();
   closeModelDropdown();
+  if(typeof closeToolsetsDropdown==='function') closeToolsetsDropdown();
   _highlightReasoningOption(_currentReasoningEffort);
   dd.classList.add('open');
   _positionReasoningDropdown();
   chip.classList.add('active');
+  const mobileAction=$('composerMobileReasoningAction');
+  if(mobileAction) mobileAction.classList.add('active');
 }
 
 function _positionReasoningDropdown(){
   const dd=$('composerReasoningDropdown');
   const chip=$('composerReasoningChip');
+  const mobileAction=$('composerMobileReasoningAction');
   const footer=document.querySelector('.composer-footer');
   if(!dd||!chip||!footer) return;
-  const chipRect=chip.getBoundingClientRect();
+  const panel=$('composerMobileConfigPanel');
+  const anchor=(panel&&panel.classList.contains('open')&&mobileAction)?mobileAction:chip;
+  const chipRect=anchor.getBoundingClientRect();
   const footerRect=footer.getBoundingClientRect();
   let left=chipRect.left-footerRect.left;
   const maxLeft=Math.max(0,footer.clientWidth-dd.offsetWidth);
@@ -695,12 +894,18 @@ function _positionReasoningDropdown(){
 function closeReasoningDropdown(){
   const dd=$('composerReasoningDropdown');
   const chip=$('composerReasoningChip');
+  const mobileAction=$('composerMobileReasoningAction');
   if(dd) dd.classList.remove('open');
   if(chip) chip.classList.remove('active');
+  if(mobileAction) mobileAction.classList.remove('active');
 }
 
 document.addEventListener('click',function(e){
-  if(!e.target.closest('#composerReasoningChip')&&!e.target.closest('#composerReasoningDropdown')) closeReasoningDropdown();
+  if(
+    !e.target.closest('#composerReasoningChip') &&
+    !e.target.closest('#composerMobileReasoningAction') &&
+    !e.target.closest('#composerReasoningDropdown')
+  ) closeReasoningDropdown();
   if(e.target.closest('.reasoning-option')){
     const opt=e.target.closest('.reasoning-option');
     const effort=opt&&opt.dataset.effort;
@@ -716,15 +921,258 @@ document.addEventListener('click',function(e){
   }
 });
 
+// ── Session toolsets chip (#493) ───────────────────────────────────────────
+let _currentSessionToolsets = null; // null = global, array = custom list
+
+function _applyToolsetsChip(toolsets) {
+  _currentSessionToolsets = toolsets;
+  const wrap = $('composerToolsetsWrap');
+  const label = $('composerToolsetsLabel');
+  const chip = $('composerToolsetsChip');
+  if (!wrap || !label) return;
+  // Visibility is controlled entirely by responsive CSS — the chip shows only
+  // at wide composer-footer widths (>= 1100px container query). At narrower
+  // widths the layout is too cramped (model + reasoning + profile + workspace
+  // + context-ring + send) to add another chip. Cleared inline style so the
+  // CSS @container query is the single source of truth. State is still
+  // tracked so /api/session/toolsets continues to work for cron/scripted
+  // callers regardless of UI visibility. (#1431)
+  wrap.style.display = '';
+  const hasCustom = Array.isArray(toolsets) && toolsets.length > 0;
+  if (hasCustom) {
+    label.textContent = toolsets.join(', ');
+    chip.classList.add('has-custom');
+    chip.title = t('session_toolsets') + ': ' + toolsets.join(', ');
+  } else {
+    label.textContent = t('session_toolsets_global');
+    chip.classList.remove('has-custom');
+    chip.title = t('session_toolsets');
+  }
+}
+
+function _syncToolsetsChip() {
+  if (typeof S === 'undefined' || !S || !S.session) {
+    _applyToolsetsChip(null);
+    return;
+  }
+  _applyToolsetsChip(S.session.enabled_toolsets || null);
+}
+
+function syncToolsetsChip() {
+  _syncToolsetsChip();
+}
+
+function _populateToolsetsDropdown() {
+  const desc = $('toolsetsDropdownDesc');
+  const state = $('toolsetsDropdownState');
+  const input = $('toolsetsInput');
+  const applyBtn = $('toolsetsApplyBtn');
+  const clearBtn = $('toolsetsClearBtn');
+  if (!desc || !state || !input) return;
+  desc.textContent = t('session_toolsets_desc');
+  if (applyBtn) applyBtn.textContent = t('session_toolsets_apply');
+  if (clearBtn) clearBtn.textContent = t('session_toolsets_clear');
+  input.placeholder = t('session_toolsets_placeholder');
+  // Escape key handler for toolsets input
+  input.onkeydown = function(e) { if(e.key === 'Escape') closeToolsetsDropdown(); };
+  const hasCustom = Array.isArray(_currentSessionToolsets) && _currentSessionToolsets.length > 0;
+  if (hasCustom) {
+    state.textContent = '🔧 ' + _currentSessionToolsets.join(', ');
+    input.value = _currentSessionToolsets.join(', ');
+  } else {
+    state.textContent = '🌍 ' + t('session_toolsets_global');
+    input.value = '';
+  }
+}
+
+function _positionToolsetsDropdown() {
+  const dd = $('composerToolsetsDropdown');
+  const chip = $('composerToolsetsChip');
+  const footer = document.querySelector('.composer-footer');
+  if (!dd || !chip || !footer) return;
+  // Defense: if the chip has been hidden by responsive CSS (e.g. resize across
+  // 1100px container threshold while dropdown was open), don't try to anchor
+  // to a zero-rect element — close the dropdown instead. (#1431)
+  if (chip.offsetParent === null) { closeToolsetsDropdown(); return; }
+  const chipRect = chip.getBoundingClientRect();
+  const footerRect = footer.getBoundingClientRect();
+  let left = chipRect.left - footerRect.left;
+  const maxLeft = Math.max(0, footer.clientWidth - dd.offsetWidth);
+  left = Math.max(0, Math.min(left, maxLeft));
+  dd.style.left = left + 'px';
+}
+
+function toggleToolsetsDropdown() {
+  const dd = $('composerToolsetsDropdown');
+  const chip = $('composerToolsetsChip');
+  if (!dd || !chip) return;
+  if (typeof S === 'undefined' || !S || !S.session) return;
+  // Don't open when the chip itself is hidden by responsive CSS (#1431).
+  // offsetParent === null catches display:none on the element or any ancestor.
+  if (chip.offsetParent === null) return;
+  const open = dd.classList.contains('open');
+  if (open) { closeToolsetsDropdown(); return; }
+  if (typeof closeProfileDropdown === 'function') closeProfileDropdown();
+  if (typeof closeWsDropdown === 'function') closeWsDropdown();
+  closeModelDropdown();
+  if (typeof closeReasoningDropdown === 'function') closeReasoningDropdown();
+  _syncToolsetsChip();
+  _populateToolsetsDropdown();
+  dd.classList.add('open');
+  _positionToolsetsDropdown();
+  chip.classList.add('active');
+  // Focus the input after a tick so the layout has settled
+  setTimeout(() => { const inp = $('toolsetsInput'); if (inp) inp.focus(); }, 50);
+}
+
+function closeToolsetsDropdown() {
+  const dd = $('composerToolsetsDropdown');
+  const chip = $('composerToolsetsChip');
+  if (dd) dd.classList.remove('open');
+  if (chip) chip.classList.remove('active');
+}
+
+function _applySessionToolsets(toolsets) {
+  if (typeof S === 'undefined' || !S || !S.session) return;
+  const sid = S.session.session_id;
+  api('/api/session/toolsets', {
+    method: 'POST',
+    body: JSON.stringify({ session_id: sid, toolsets: toolsets })
+  })
+    .then(function(r) {
+      if (r && r.ok) {
+        S.session.enabled_toolsets = r.enabled_toolsets || null;
+        _applyToolsetsChip(r.enabled_toolsets || null);
+        if (r.enabled_toolsets && r.enabled_toolsets.length) {
+          showToast('🔧 ' + t('session_toolsets_applied') + ': ' + r.enabled_toolsets.join(', '));
+        } else {
+          showToast('🌍 ' + t('session_toolsets_cleared'));
+        }
+      } else {
+        showToast(t('session_toolsets_failed') + (r && r.error ? r.error : 'Unknown error'), 3000, 'error');
+      }
+    })
+    .catch(function(err) {
+      showToast(t('session_toolsets_failed') + (err.message || err), 3000, 'error');
+    });
+}
+
+// Click-outside handler for toolsets dropdown
+document.addEventListener('click', function(e) {
+  if (
+    !e.target.closest('#composerToolsetsChip') &&
+    !e.target.closest('#composerToolsetsDropdown')
+  ) closeToolsetsDropdown();
+  // Apply button
+  if (e.target.closest('#toolsetsApplyBtn')) {
+    const input = $('toolsetsInput');
+    if (!input) return;
+    const raw = input.value.trim();
+    if (!raw) {
+      showToast(t('session_toolsets_desc'), 2000);
+      return;
+    }
+    const toolsets = raw.split(',').map(s => s.trim()).filter(Boolean);
+    if (toolsets.length === 0) {
+      showToast(t('session_toolsets_desc'), 2000);
+      return;
+    }
+    _applySessionToolsets(toolsets);
+    closeToolsetsDropdown();
+  }
+  // Clear button
+  if (e.target.closest('#toolsetsClearBtn')) {
+    _applySessionToolsets(null);
+    closeToolsetsDropdown();
+  }
+});
+
+// Position toolsets dropdown on resize, OR close it if the chip is no longer
+// visible (e.g. resize crossed the 1100px container threshold while dropdown
+// was open — the wrap is hidden by CSS but the dropdown sibling stays open
+// without an anchor). (#1431)
+window.addEventListener('resize', () => {
+  const dd = $('composerToolsetsDropdown');
+  if (!dd || !dd.classList.contains('open')) return;
+  const chip = $('composerToolsetsChip');
+  if (!chip || chip.offsetParent === null) { closeToolsetsDropdown(); return; }
+  _positionToolsetsDropdown();
+});
+
+function _syncMobileComposerConfigButton(open){
+  const btn=$('composerMobileConfigBtn');
+  if(!btn) return;
+  btn.classList.toggle('active',!!open);
+  btn.setAttribute('aria-expanded',open?'true':'false');
+}
+
+function closeMobileComposerConfig(){
+  const panel=$('composerMobileConfigPanel');
+  if(panel) panel.classList.remove('open');
+  _syncMobileComposerConfigButton(false);
+  if(typeof closeWsDropdown==='function') closeWsDropdown();
+}
+
+function toggleMobileComposerConfig(){
+  const panel=$('composerMobileConfigPanel');
+  if(!panel) return;
+  const open=panel.classList.contains('open');
+  if(open){
+    closeMobileComposerConfig();
+    closeModelDropdown();
+    closeReasoningDropdown();
+    if(typeof closeToolsetsDropdown==='function') closeToolsetsDropdown();
+    return;
+  }
+  if(typeof closeProfileDropdown==='function') closeProfileDropdown();
+  if(typeof closeWsDropdown==='function') closeWsDropdown();
+  closeModelDropdown();
+  closeReasoningDropdown();
+  if(typeof closeToolsetsDropdown==='function') closeToolsetsDropdown();
+  panel.classList.add('open');
+  _syncMobileComposerConfigButton(true);
+}
+
+document.addEventListener('click',function(e){
+  if(
+    e.target.closest('#composerMobileConfigBtn') ||
+    e.target.closest('#composerMobileConfigPanel') ||
+    e.target.closest('#composerWsDropdown') ||
+    e.target.closest('#composerModelDropdown') ||
+    e.target.closest('#composerReasoningDropdown')
+  ) return;
+  closeMobileComposerConfig();
+});
+
+document.addEventListener('keydown',function(e){
+  if(e.key!=='Escape') return;
+  const panel=$('composerMobileConfigPanel');
+  if(!panel||!panel.classList.contains('open')) return;
+  e.preventDefault();
+  closeMobileComposerConfig();
+  if(typeof closeWsDropdown==='function') closeWsDropdown();
+  closeModelDropdown();
+  closeReasoningDropdown();
+});
+
+window.addEventListener('resize',function(){
+  if(window.matchMedia && !window.matchMedia('(max-width: 640px)').matches){
+    closeMobileComposerConfig();
+    closeModelDropdown();
+    closeReasoningDropdown();
+    if(typeof closeWsDropdown==='function') closeWsDropdown();
+  }
+});
+
 // ── Scroll pinning ──────────────────────────────────────────────────────────
 // When streaming, auto-scroll only if the user hasn't manually scrolled up.
-// Once the user scrolls back to within 150px of the bottom, re-pin.
+// Once the user scrolls back to within 250px of the bottom, re-pin.
 let _scrollPinned=true;
 (function(){
   const el=document.getElementById('messages');
   if(!el) return;
   el.addEventListener('scroll',()=>{
-    const nearBottom=el.scrollHeight-el.scrollTop-el.clientHeight<150;
+    const nearBottom=el.scrollHeight-el.scrollTop-el.clientHeight<250;
     _scrollPinned=nearBottom;
     const btn=$('scrollToBottomBtn');
     if(btn) btn.style.display=_scrollPinned?'none':'flex';
@@ -736,23 +1184,112 @@ let _scrollPinned=true;
 })();
 function _fmtTokens(n){if(!n||n<0)return'0';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'k';return String(n);}
 
+const _MOBILE_CONFIG_BASE_LABEL='Workspace, model, reasoning, and context settings';
+
+function _setCtxCompressButton(btn,text){
+  if(!btn)return;
+  if(text){
+    btn.style.display='';
+    btn.textContent=text;
+    btn.onclick=function(e){
+      if(e)e.stopPropagation();
+      const ta=$('msg');
+      if(ta){ta.value='/compress ';ta.focus();autoResize();}
+    };
+  }else{
+    btn.style.display='none';
+    btn.textContent='';
+    btn.onclick=null;
+  }
+}
+
+function _syncMobileCtxDisplay(state){
+  const badge=$('composerMobileCtxBadge');
+  const mobileConfigBtn=$('composerMobileConfigBtn');
+  const row=$('composerMobileContextAction');
+  const usageLine=$('composerMobileContextUsage');
+  const tokensLine=$('composerMobileContextTokens');
+  const thresholdLine=$('composerMobileContextThreshold');
+  const costLine=$('composerMobileContextCost');
+  const compressBtn=$('composerMobileCtxCompressBtn');
+  if(!state||!state.visible){
+    if(badge)badge.style.display='none';
+    if(row)row.style.display='none';
+    if(mobileConfigBtn){
+      mobileConfigBtn.setAttribute('aria-label',_MOBILE_CONFIG_BASE_LABEL);
+      mobileConfigBtn.setAttribute('title',_MOBILE_CONFIG_BASE_LABEL);
+    }
+    _setCtxCompressButton(compressBtn,'');
+    return;
+  }
+  if(badge){
+    badge.style.display='inline-flex';
+    badge.textContent=state.hasPromptTok?String(state.pct):'\u00b7';
+    badge.classList.toggle('ctx-mid',state.pct>50&&state.pct<=75);
+    badge.classList.toggle('ctx-high',state.pct>75);
+    badge.setAttribute('title',state.label);
+  }
+  if(mobileConfigBtn){
+    mobileConfigBtn.setAttribute('aria-label',`${_MOBILE_CONFIG_BASE_LABEL}; ${state.label}`);
+    mobileConfigBtn.setAttribute('title',`${_MOBILE_CONFIG_BASE_LABEL} \u00b7 ${state.label}`);
+  }
+  if(row){
+    row.style.display='';
+    row.setAttribute('aria-label',state.label);
+    row.classList.toggle('ctx-mid',state.pct>50&&state.pct<=75);
+    row.classList.toggle('ctx-high',state.pct>75);
+  }
+  if(usageLine)usageLine.textContent=state.usageText||'';
+  if(tokensLine)tokensLine.textContent=state.tokensText||'';
+  if(thresholdLine){
+    if(state.thresholdText){
+      thresholdLine.style.display='';
+      thresholdLine.textContent=state.thresholdText;
+    }else{
+      thresholdLine.style.display='none';
+      thresholdLine.textContent='';
+    }
+  }
+  if(costLine){
+    if(state.costText){
+      costLine.style.display='';
+      costLine.textContent=state.costText;
+    }else{
+      costLine.style.display='none';
+      costLine.textContent='';
+    }
+  }
+  _setCtxCompressButton(compressBtn,state.compressText||'');
+}
+
 // Context usage indicator in composer footer
 function _syncCtxIndicator(usage){
   const wrap=$('ctxIndicatorWrap');
   const el=$('ctxIndicator');
   if(!el)return;
-  const promptTok=usage.last_prompt_tokens||usage.input_tokens||0;
+  // #1436: Use last_prompt_tokens only — NEVER fall back to cumulative
+  // input_tokens for the "context window % used" calculation.  input_tokens
+  // is summed across all turns, so dividing it by the context window gives a
+  // nonsense percentage (often >100%) on long sessions.  When we have no
+  // last-prompt data we render "·" + "tokens used" via the !hasPromptTok
+  // branch below — honest "no data" instead of misleading "890% used".
+  const promptTok=usage.last_prompt_tokens||0;
   const totalTok=(usage.input_tokens||0)+(usage.output_tokens||0);
-  const ctxWindow=usage.context_length||0;
+  // Default context window to 128K when not provided by backend
+  const DEFAULT_CTX=128*1024;
+  const ctxWindow=usage.context_length||DEFAULT_CTX;
   const cost=usage.estimated_cost;
   // Show indicator whenever we have any usage data (tokens or cost)
   if(!promptTok&&!totalTok&&!cost){
     if(wrap) wrap.style.display='none';
+    _syncMobileCtxDisplay({visible:false});
     return;
   }
   if(wrap) wrap.style.display='';
-  const hasCtxWindow=!!(promptTok&&ctxWindow);
-  const pct=hasCtxWindow?Math.min(100,Math.round((promptTok/ctxWindow)*100)):0;
+  const hasPromptTok=!!promptTok;
+  const rawPct=hasPromptTok?Math.round((promptTok/ctxWindow)*100):0;
+  const pct=Math.min(100,rawPct);
+  const overflowed=rawPct>100;
   const ring=$('ctxRingValue');
   const center=$('ctxPercent');
   const usageLine=$('ctxTooltipUsage');
@@ -764,7 +1301,8 @@ function _syncCtxIndicator(usage){
     ring.style.strokeDasharray=String(circumference);
     ring.style.strokeDashoffset=String(circumference*(1-pct/100));
   }
-  if(center) center.textContent=hasCtxWindow?String(pct):'\u00b7';
+  if(center) center.textContent=hasPromptTok?String(pct):'\u00b7';
+  const hasExplicitCtx=!!usage.context_length;
   el.classList.toggle('ctx-mid',pct>50&&pct<=75);
   el.classList.toggle('ctx-high',pct>75);
   // ── Compress affordance (#524) ──
@@ -772,49 +1310,51 @@ function _syncCtxIndicator(usage){
   // discover /compress without having to know the slash command.
   const compressWrap=$('ctxTooltipCompress');
   const compressBtn=$('ctxCompressBtn');
-  if(compressWrap&&compressBtn){
-    if(pct>=75){
-      compressWrap.style.display='';
-      compressBtn.textContent=t('ctx_compress_action');
-      compressBtn.onclick=function(){
-        const ta=$('msg');
-        if(ta){ta.value='/compress ';ta.focus();autoResize();}
-      };
-    }else if(pct>=50){
-      compressWrap.style.display='';
-      compressBtn.textContent=t('ctx_compress_hint');
-      compressBtn.onclick=function(){
-        const ta=$('msg');
-        if(ta){ta.value='/compress ';ta.focus();autoResize();}
-      };
-    }else{
-      compressWrap.style.display='none';
-    }
-  }
-  let label=hasCtxWindow?`Context window ${pct}% used`:`${_fmtTokens(totalTok)} tokens used`;
+  const compressText=pct>=75?t('ctx_compress_action'):(pct>=50?t('ctx_compress_hint'):'');
+  if(compressWrap) compressWrap.style.display=compressText?'':'none';
+  _setCtxCompressButton(compressBtn,compressText);
+  let label=hasPromptTok?`Context window ${pct}% used`:`${_fmtTokens(totalTok)} tokens used`;
+  if(!hasExplicitCtx&&hasPromptTok) label+=' (est. 128K)';
   if(cost) label+=` \u00b7 $${cost<0.01?cost.toFixed(4):cost.toFixed(2)}`;
   el.setAttribute('aria-label',label);
-  if(usageLine) usageLine.textContent=hasCtxWindow?`${pct}% used (${Math.max(0,100-pct)}% left)`:`${_fmtTokens(totalTok)} tokens used`;
-  if(tokensLine) tokensLine.textContent=hasCtxWindow?`${_fmtTokens(promptTok)} / ${_fmtTokens(ctxWindow)} tokens used`:`In: ${_fmtTokens(usage.input_tokens||0)} \u00b7 Out: ${_fmtTokens(usage.output_tokens||0)}`;
+  const usageText=hasPromptTok?(overflowed?`${rawPct}% used (context exceeded)`:`${pct}% used (${100-pct}% left)`):`${_fmtTokens(totalTok)} tokens used`;
+  const tokensText=hasPromptTok?`${_fmtTokens(promptTok)} / ${_fmtTokens(ctxWindow)} tokens used`:`In: ${_fmtTokens(usage.input_tokens||0)} \u00b7 Out: ${_fmtTokens(usage.output_tokens||0)}`;
+  if(usageLine) usageLine.textContent=usageText;
+  if(tokensLine) tokensLine.textContent=tokensText;
   const threshold=usage.threshold_tokens||0;
+  let thresholdText='';
   if(thresholdLine){
     if(threshold&&ctxWindow){
+      thresholdText=`Auto-compress at ${_fmtTokens(threshold)} (${Math.round(threshold/ctxWindow*100)}%)`;
       thresholdLine.style.display='';
-      thresholdLine.textContent=`Auto-compress at ${_fmtTokens(threshold)} (${Math.round(threshold/ctxWindow*100)}%)`;
+      thresholdLine.textContent=thresholdText;
     }else{
       thresholdLine.style.display='none';
       thresholdLine.textContent='';
     }
   }
+  let costText='';
   if(costLine){
     if(cost){
+      costText=`Estimated cost: $${cost<0.01?cost.toFixed(4):cost.toFixed(2)}`;
       costLine.style.display='';
-      costLine.textContent=`Estimated cost: $${cost<0.01?cost.toFixed(4):cost.toFixed(2)}`;
+      costLine.textContent=costText;
     }else{
       costLine.style.display='none';
       costLine.textContent='';
     }
   }
+  _syncMobileCtxDisplay({
+    visible:true,
+    hasPromptTok,
+    pct,
+    label,
+    usageText,
+    tokensText,
+    thresholdText,
+    costText,
+    compressText
+  });
 }
 
 // ── Touch support: toggle context tooltip on tap (#524) ──
@@ -1011,14 +1551,24 @@ function renderMd(raw){
   // breaking </pre> closure and corrupting all subsequent message rendering.
   const _preBlock_stash=[];
   const fence_stash=[];
-  s=s.replace(/```([\s\S]*?)```/g,(_,raw)=>{
+  // CommonMark §4.5: opening fence must start a line (with up to 3 spaces of indent)
+  // and closing fence must also start a line. Without line anchoring, a literal ``` inside
+  // a code block (e.g. a regex pattern with ``` in a lookbehind, a script that documents
+  // fences) terminates the outer block at the wrong place, leaking content into the
+  // markdown stream where bold/italic/inline-code passes corrupt it. Fixes #1438.
+  s=s.replace(/(^|\n)[ ]{0,3}```(?:([\s\S]*?)\n)?[ ]{0,3}```(?=\n|$)/g,(_,lead,raw)=>{
     const m=raw.match(/^(\w[\w+-]*)\n?([\s\S]*)$/);
-    if(m&&m[1].trim().toLowerCase()==='mermaid'){
+    const lang=m?(m[1]||'').trim().toLowerCase():'';
+    const code=m?m[2]:raw.replace(/^\n?/,'');
+    const codeLines=code.split('\n');
+    const firstCodeLine=codeLines.find(line=>line.trim())||'';
+    const firstMermaidLine=codeLines.map(line=>line.trim()).find(line=>line&&!line.startsWith('%%'))||'';
+    const looksLikeLineNumberedToolOutput=/^\s*\d+\|/.test(firstCodeLine);
+    const looksLikeMermaidStart=firstMermaidLine==='---'||/^(graph|flowchart|sequenceDiagram|classDiagram|classDiagram-v2|stateDiagram|stateDiagram-v2|erDiagram|journey|gantt|pie|gitGraph|mindmap|timeline|quadrantChart|requirementDiagram|C4Context|C4Container|C4Component|C4Dynamic|c4Context|c4Container|c4Component|c4Dynamic|sankey-beta|block-beta|packet-beta|xychart-beta|kanban|architecture-beta)\b/.test(firstMermaidLine);
+    if(lang==='mermaid'&&!looksLikeLineNumberedToolOutput&&looksLikeMermaidStart){
       const id='mermaid-'+Math.random().toString(36).slice(2,10);
-      _preBlock_stash.push(`<div class="mermaid-block" data-mermaid-id="${id}">${esc(m[2].trim())}</div>`);
+      _preBlock_stash.push(`<div class="mermaid-block" data-mermaid-id="${id}">${esc(code.trim())}</div>`);
     } else {
-      const lang=m?(m[1]||'').trim().toLowerCase():'';
-      const code=m?m[2]:raw.replace(/^\n?/,'');
       const h=lang?`<div class="pre-header">${esc(lang)}</div>`:'';
       const langAttr=lang?` class="language-${esc(lang)}"`:'';
       // For diff/patch blocks, wrap each line in a colored span
@@ -1033,8 +1583,11 @@ function renderMd(raw){
       // For JSON/YAML blocks, add tree-view placeholder with raw data
       } else if(lang==='json'||lang==='yaml'){
         const rawCode=esc(code.replace(/\n$/,''));
+        // Encode newlines as &#10; to prevent HTML attribute normalization
+        // (browsers collapse \n to spaces inside attribute values).
+        const rawAttr=rawCode.replace(/"/g,'&quot;').replace(/\n/g,'&#10;');
         const blockId='tree-'+Math.random().toString(36).slice(2,10);
-        _preBlock_stash.push(`<div class="code-tree-wrap" data-raw="${rawCode.replace(/"/g,'&quot;')}" data-lang="${lang}" id="${blockId}">${h}<pre class="tree-raw-view"><code${langAttr}>${rawCode}</code></pre></div>`);
+        _preBlock_stash.push(`<div class="code-tree-wrap" data-raw="${rawAttr}" data-lang="${lang}" id="${blockId}">${h}<pre class="tree-raw-view"><code${langAttr}>${rawCode}</code></pre></div>`);
       // CSV blocks → render as styled table
       } else if(lang==='csv'){
         const rows=code.replace(/\n$/,'').split('\n').filter(r=>r.trim());
@@ -1049,7 +1602,7 @@ function renderMd(raw){
         _preBlock_stash.push(`${h}<pre><code${langAttr}>${esc(code.replace(/\n$/,''))}</code></pre>`);
       }
     }
-    return '\x00P'+(_preBlock_stash.length-1)+'\x00';
+    return lead+'\x00P'+(_preBlock_stash.length-1)+'\x00';
   });
   s=s.replace(/`([^`\n]+)`/g,(_,c)=>{fence_stash.push('<code>'+esc(c)+'</code>');return '\x00F'+(fence_stash.length-1)+'\x00';});
   // Math stash: protect $$..$$ and $..$ from markdown processing
@@ -1076,6 +1629,31 @@ function renderMd(raw){
   s=s.replace(/<code>([^<]*?)<\/code>/gi,(_,t)=>'`'+t+'`');
   s=s.replace(/<br\s*\/?>/gi,'\n');
   s=s.replace(/\x00R(\d+)\x00/g,(_,i)=>rawPreStash[+i]);
+  // ── Glued-bold-heading lift (issue #1446) ────────────────────────────────
+  // LLMs in thinking/reasoning mode frequently emit a "section header" glued
+  // to the end of the previous paragraph with no whitespace, like:
+  //
+  //   Para 1 text.**Heading to Para 2**
+  //
+  //   Para 2 text.**Heading to Para 3**
+  //
+  // CommonMark renders that correctly as paragraph-end inline bold, but the
+  // visual effect is a run-on label rather than a section break. Lift the
+  // glued bold into its own paragraph when it follows a sentence terminator
+  // and is followed by a blank line.
+  //
+  // Constraints (avoid false positives):
+  //   - Trigger only on a sentence terminator (.!?) IMMEDIATELY before `**`
+  //     (no space) — that pattern is almost always a glued heading, not
+  //     intentional emphasis.
+  //   - Inner text length ≤ 80 chars — long bold runs are usually emphasis
+  //     prose, not headings.
+  //   - Trailing `\n\n` required — preserves mid-paragraph emphasis like
+  //     "this is **important**." untouched.
+  //   - Inner text must not contain newlines or `*` (single-line bold only).
+  //   - Runs after fenced code, math, and raw <pre> are stashed, so code
+  //     content is protected (see pipeline notes).
+  s=s.replace(/([.!?])\*\*([^*\n]{1,80})\*\*\n\n/g,'$1\n\n**$2**\n\n');
   // Inline backtick spans: restore <code> tags produced in the stash callback above.
   // Must happen BEFORE bold/italic so **`code`** → <strong><code>code</code></strong>.
   s=s.replace(/\x00F(\d+)\x00/g,(_,i)=>fence_stash[+i]);
@@ -1584,7 +2162,10 @@ function setBusy(v){
         // Note: profile is NOT restored — full profile switch requires server interaction
         if(next.model&&S.session&&next.model!==S.session.model){
           S.session.model=next.model;
-          if(typeof _applyModelToDropdown==='function'&&$('modelSelect')) _applyModelToDropdown(next.model,$('modelSelect'));
+        }
+        if(next.model_provider&&S.session) S.session.model_provider=next.model_provider;
+        if(next.model&&S.session){
+          if(typeof _applyModelToDropdown==='function'&&$('modelSelect')) _applyModelToDropdown(next.model,$('modelSelect'),S.session.model_provider||null);
           if(typeof syncModelChip==='function') syncModelChip();
         }
         autoResize();
@@ -1636,7 +2217,8 @@ function _renderQueueChips(sid){
       if(!card.classList.contains('visible')) return;
       const h=card.getBoundingClientRect().height;
       if(h>0) _msgs.style.setProperty('--queue-card-height', h+'px');
-      if(typeof scrollToBottom==='function') scrollToBottom();
+      if(S.activeStreamId&&typeof scrollIfPinned==='function') scrollIfPinned();
+      else if(!S.activeStreamId&&typeof scrollToBottom==='function') scrollToBottom();
     }, 360);
   }
 
@@ -1666,8 +2248,9 @@ function _renderQueueChips(sid){
       const _doMerge=(snapshot)=>{
         const combined=snapshot.map(e=>e&&(e.text||e.message||e.content||'')).filter(Boolean).join('\n\n');
         const liveQ=_getSessionQueue(sid,false);
+        const first=snapshot.find(e=>e)||{};
         const firstFiles=(snapshot.find(e=>e&&Array.isArray(e.files)&&e.files.length)||{files:[]}).files;
-        liveQ.length=0;liveQ.push({text:combined,files:firstFiles,_queued_at:Date.now()});
+        liveQ.length=0;liveQ.push({text:combined,files:firstFiles,model:first.model||'',model_provider:first.model_provider||null,_queued_at:Date.now()});
         SESSION_QUEUES[sid]=liveQ;
         try{sessionStorage.setItem('hermes-queue-'+sid,JSON.stringify(liveQ));}catch(_){}
         delete _queueRenderKeys[sid];
@@ -1825,7 +2408,8 @@ function _updateQueuePill(sid,count){
         }, 360);
       }
       if(pillOuter) pillOuter.classList.remove('show');
-      if(typeof scrollToBottom==='function') scrollToBottom();
+      if(S.activeStreamId&&typeof scrollIfPinned==='function') scrollIfPinned();
+      else if(!S.activeStreamId&&typeof scrollToBottom==='function') scrollToBottom();
     };
   } else {
     if(pillOuter) pillOuter.classList.remove('show');
@@ -1928,7 +2512,7 @@ function _ensureAppDialogBindings(){
       return;
     }
     if(e.key==='Enter'){
-      if(e.isComposing) return;
+      if(window._isImeEnter&&window._isImeEnter(e)) return;
       const target=e.target;
       const isTextarea=target&&target.tagName==='TEXTAREA';
       if(!isTextarea){
@@ -2036,8 +2620,8 @@ function copyMsg(btn){
 // ── TTS: Text-to-Speech via Web Speech API (#499) ──
 // Strips markdown, code blocks, and MEDIA: paths for clean speech output.
 function _stripForTTS(text){
-  // Remove code blocks entirely (```)
-  text=text.replace(/```[\s\S]*?```/g,' ');
+  // Remove code blocks entirely (```) — line-anchored to match #1438 fix
+  text=text.replace(/(^|\n)[ ]{0,3}```(?:[\s\S]*?\n)?[ ]{0,3}```(?=\n|$)/g,' ');
   // Remove inline code
   text=text.replace(/`[^`]+`/g,' ');
   // Strip bold/italic
@@ -2428,10 +3012,12 @@ function syncTopbar(){
   let currentModel=S.session.model||'';
   if(modelOverride){
     S._pendingProfileModel=null;
-    _applyModelToDropdown(modelOverride,$('modelSelect'));
+    const providerOverride=S._pendingProfileModelProvider||null;
+    S._pendingProfileModelProvider=null;
+    _applyModelToDropdown(modelOverride,$('modelSelect'),providerOverride);
     currentModel=modelOverride;
   } else {
-    const applied=_applyModelToDropdown(currentModel,$('modelSelect'));
+    const applied=_applyModelToDropdown(currentModel,$('modelSelect'),S.session.model_provider||null);
     // If the model isn't in the current provider list, silently reset to the
     // first available model so stale values don't pollute the picker (#829).
     if(!applied && currentModel){
@@ -2453,11 +3039,12 @@ function syncTopbar(){
           modelSel.value=first.value;
           if(!deferModelCorrection){
             S.session.model=first.value;
+            S.session.model_provider=_getOptionProviderId(first)||null;
             // Persist the correction so the session doesn't re-inject on next load.
-            fetch(new URL('api/session/update',location.href).href,{
+            fetch(new URL('api/session/update',document.baseURI||location.href).href,{
               method:'POST',credentials:'include',
               headers:{'Content-Type':'application/json'},
-              body:JSON.stringify({session_id:S.session.id||S.session.session_id,model:first.value})
+              body:JSON.stringify({session_id:S.session.id||S.session.session_id,model:first.value,model_provider:S.session.model_provider||null})
             }).catch(()=>{});
           }
         }
@@ -2466,6 +3053,7 @@ function syncTopbar(){
   }
   if(typeof syncModelChip==='function') syncModelChip();
   if(typeof syncReasoningChip==='function') syncReasoningChip();
+  if(typeof syncToolsetsChip==='function') syncToolsetsChip();
   // Show Clear button only when session has messages
   const clearBtn=$('btnClearConv');
   if(clearBtn) clearBtn.style.display=(S.messages&&S.messages.filter(msg=>msg.role!=='tool').length>0)?'':'none';
@@ -2530,6 +3118,30 @@ function _thinkingActivityNode(text){
   row.innerHTML=_thinkingCardHtml(text);
   return row;
 }
+// ── Activity-group user expand intent (#1298) ──────────────────────────────
+// When the user manually expands the live "Activity" dropdown during streaming,
+// preserve that intent across the destroy/recreate cycle that fires on every
+// thinking/tool event. Without this, ensureActivityGroup() re-creates the group
+// with the default collapsed state and finalizeThinkingCard() force-collapses
+// it whenever the assistant transitions from thinking → tool → thinking, so
+// the panel snaps shut every few seconds while the user is trying to read it.
+//
+// The tracker is a singleton boolean: there is at most one live activity group
+// at a time (selector .tool-call-group[data-live-tool-call-group="1"]). It is
+// set to true when the user clicks the summary to expand, false when they
+// click to collapse, and cleared back to undefined when the live group is
+// finalized into a settled assistant turn (the live attribute is removed in
+// _convertLiveActivityGroupToSettled / when liveAssistantTurn loses its id).
+let _liveActivityUserExpanded;
+function _onLiveActivityToggle(group){
+  if(!group) return;
+  // Only track explicit user clicks on the live group, not programmatic toggles.
+  if(group.getAttribute('data-live-tool-call-group')!=='1') return;
+  _liveActivityUserExpanded = !group.classList.contains('tool-call-group-collapsed');
+}
+function _clearLiveActivityUserIntent(){
+  _liveActivityUserExpanded = undefined;
+}
 function ensureActivityGroup(inner, opts){
   opts=opts||{};
   if(!inner) return null;
@@ -2538,12 +3150,16 @@ function ensureActivityGroup(inner, opts){
   let group=inner.querySelector(selector);
   if(!group){
     group=document.createElement('div');
-    const collapsed=opts.collapsed!==false;
+    let collapsed=opts.collapsed!==false;
+    // Restore the user's explicit expand intent when recreating the live
+    // activity group within the same turn (#1298).
+    if(live && _liveActivityUserExpanded === true) collapsed=false;
+    else if(live && _liveActivityUserExpanded === false) collapsed=true;
     group.className='tool-call-group agent-activity-group'+(collapsed?' tool-call-group-collapsed':'');
     group.setAttribute('data-tool-call-group','1');
     group.setAttribute('data-agent-activity-group','1');
     if(live) group.setAttribute('data-live-tool-call-group','1');
-    group.innerHTML=`<button type="button" class="tool-call-group-summary" aria-expanded="${collapsed?'false':'true'}" onclick="const g=this.closest('.tool-call-group');const c=g.classList.toggle('tool-call-group-collapsed');this.setAttribute('aria-expanded',String(!c));"><span class="tool-call-group-chevron">${li('chevron-right',12)}</span><span class="tool-call-group-label">Activity</span><span class="tool-call-group-list">tools / thinking</span><span class="tool-call-group-count">0</span></button><div class="tool-call-group-body"></div>`;
+    group.innerHTML=`<button type="button" class="tool-call-group-summary" aria-expanded="${collapsed?'false':'true'}" onclick="const g=this.closest('.tool-call-group');const c=g.classList.toggle('tool-call-group-collapsed');this.setAttribute('aria-expanded',String(!c));if(typeof _onLiveActivityToggle==='function')_onLiveActivityToggle(g);"><span class="tool-call-group-chevron">${li('chevron-right',12)}</span><span class="tool-call-group-label">Activity</span><span class="tool-call-group-list">tools / thinking</span><span class="tool-call-group-count">0</span></button><div class="tool-call-group-body"></div>`;
     const anchor=opts.anchor||null;
     if(anchor&&anchor.parentElement===inner) anchor.insertAdjacentElement('afterend', group);
     else inner.appendChild(group);
@@ -2970,12 +3586,13 @@ function renderMessages(){
         return _renderAttachmentHtml(fname,fileUrl);
       }).join('')}</div>`;
     }
-    const bodyHtml = isUser ? esc(String(content)).replace(/\n/g,'<br>') : renderMd(_stripXmlToolCallsDisplay(String(content)));
+    const bodyHtml = isUser ? _renderUserFencedBlocks(content) : renderMd(_stripXmlToolCallsDisplay(String(content)));
     const isEditableUser=isUser&&rawIdx===lastUserRawIdx;
     const editBtn  = isEditableUser ? `<button class="msg-action-btn" title="${t('edit_message')}" onclick="editMessage(this)">${li('pencil',13)}</button>` : '';
     const undoBtn  = isLastAssistant ? `<button class="msg-action-btn" title="${t('undo_exchange')}" onclick="undoLastExchange()">${li('undo',13)}</button>` : '';
     const retryBtn = isLastAssistant ? `<button class="msg-action-btn" title="${t('regenerate')}" onclick="regenerateResponse(this)">${li('rotate-ccw',13)}</button>` : '';
     const copyBtn  = `<button class="msg-copy-btn msg-action-btn" title="${t('copy')}" onclick="copyMsg(this)">${li('copy',13)}</button>`;
+    const forkBtn  = `<button class="msg-action-btn" title="${t('fork_from_here')}" onclick="forkFromMessage(${rawIdx+1})">${li('git-branch',13)}</button>`;
     const ttsBtn   = !isUser ? `<button class="msg-action-btn msg-tts-btn" title="${t('tts_listen')||'Listen'}" onclick="speakMessage(this)">${li('volume-2',13)}</button>` : '';
     const tsVal=m._ts||m.timestamp;
     // _formatInServerTz handles fractional-hour offsets (India +0530 etc.)
@@ -2984,7 +3601,7 @@ function renderMessages(){
     const tsTitle=tsVal?(_fmtSv?_fmtSv(new Date(tsVal*1000),{}):new Date(tsVal*1000).toLocaleString()):'';
     const tsTime=_formatMessageFooterTimestamp(tsVal);
     const timeHtml = tsTime ? `<span class="msg-time" title="${esc(tsTitle)}">${tsTime}</span>` : '';
-    const footHtml = `<div class="msg-foot">${timeHtml}<span class="msg-actions">${editBtn}${ttsBtn}${copyBtn}${retryBtn}</span></div>`;
+    const footHtml = `<div class="msg-foot">${timeHtml}<span class="msg-actions">${editBtn}${ttsBtn}${forkBtn}${copyBtn}${retryBtn}</span></div>`;
 
     if(_isContextCompactionMessage(m)){
       if(compressionState || referenceNode){
@@ -3023,6 +3640,11 @@ function renderMessages(){
     seg.dataset.rawText=String(content).trim();
     if(m._live){
       currentAssistantTurn.id='liveAssistantTurn';
+      // Stamp the session id on the live turn so finalizeThinkingCard()
+      // and other late callbacks can verify they're operating on the
+      // right session's DOM (the user may have switched tabs/sessions
+      // while this stream is still streaming). See #1366.
+      if(S.session) currentAssistantTurn.dataset.sessionId=S.session.session_id;
       seg.setAttribute('data-live-assistant','1');
     }
     if(_ERR_MSG_RE.test(String(content||'').trim())) seg.dataset.error='1';
@@ -3394,6 +4016,7 @@ function appendLiveToolCard(tc){
   if(!turn){
     turn=_createAssistantTurn();
     turn.id='liveAssistantTurn';
+    if(S.session) turn.dataset.sessionId=S.session.session_id;  // see #1366
     $('msgInner').appendChild(turn);
   }
   const inner=_assistantTurnBlocks(turn);
@@ -3462,6 +4085,9 @@ function appendLiveToolCard(tc){
 function clearLiveToolCards(){
   const inner=_assistantTurnBlocks($('liveAssistantTurn'));
   if(inner) inner.querySelectorAll('.tool-call-group[data-live-tool-call-group],.tool-card-row[data-live-tid]').forEach(el=>el.remove());
+  // Reset the per-turn user expand intent so the next turn starts at the
+  // default collapsed state (#1298).
+  if(typeof _clearLiveActivityUserIntent==='function') _clearLiveActivityUserIntent();
   // Legacy #liveToolCards container cleanup — kept for safety in case any
   // leftover cards were inserted there before this refactor took effect.
   const container=$('liveToolCards');
@@ -3503,7 +4129,7 @@ function editMessage(btn) {
   bar.querySelector('.msg-edit-cancel').onclick = () => cancelEdit(row, originalText, body);
 
   ta.addEventListener('keydown', e => {
-    if(e.key==='Enter' && !e.shiftKey) { if(e.isComposing) return; e.preventDefault(); bar.querySelector('.msg-edit-send').click(); }
+    if(e.key==='Enter' && !e.shiftKey) { if(window._isImeEnter&&window._isImeEnter(e)) return; e.preventDefault(); bar.querySelector('.msg-edit-send').click(); }
     if(e.key==='Escape') { e.preventDefault(); cancelEdit(row, originalText, body); }
   });
 }
@@ -3589,7 +4215,6 @@ function _loadJsyamlThen(cb){
 
 function initTreeViews(){
   document.querySelectorAll('.code-tree-wrap:not([data-tree-init])').forEach(wrap=>{
-    wrap.setAttribute('data-tree-init','1');
     const rawText=wrap.dataset.raw;
     const lang=wrap.dataset.lang;
     let parsed=null;
@@ -3601,10 +4226,16 @@ function initTreeViews(){
       if(typeof jsyaml!=='undefined'){
         try{ parsed=jsyaml.load(rawText); }catch(e){ parseFailed=true; }
       }else{
-        // Trigger async load, leave as raw for now
-        parseFailed=true;
+        // Defer: remove init marker so we retry after load.
+        // Note: if CDN load fails, s.onerror does NOT call back —
+        // the wrap stays un-initialised (raw view only), which is safe.
+        wrap.removeAttribute('data-tree-init');
+        _loadJsyamlThen(initTreeViews);
+        return;
       }
     }
+    // Mark as initialised only after we've committed to a render decision
+    wrap.setAttribute('data-tree-init','1');
     if(!parsed || typeof parsed!=='object'){
       if(parseFailed){
         const hint=wrap.querySelector('.tree-raw-view');
@@ -3712,7 +4343,8 @@ function addCopyButtons(container){
   if(!el) return;
   el.querySelectorAll('pre > code').forEach(codeEl=>{
     const pre=codeEl.parentElement;
-    if(pre.querySelector('.code-copy-btn')) return;
+    const header=pre.previousElementSibling;
+    if(pre.querySelector('.code-copy-btn')||(header&&header.classList.contains('pre-header')&&header.querySelector('.code-copy-btn'))) return;
     const btn=document.createElement('button');
     btn.className='code-copy-btn';
     btn.textContent=t('copy');
@@ -3723,7 +4355,6 @@ function addCopyButtons(container){
         setTimeout(()=>{btn.textContent=t('copy');},1500);
       }).catch(()=>{btn.textContent=t('copy_failed');setTimeout(()=>{btn.textContent=t('copy');},1500);});
     };
-    const header=pre.previousElementSibling;
     if(header&&header.classList.contains('pre-header')){
       header.style.display='flex';
       header.style.justifyContent='space-between';
@@ -4058,10 +4689,17 @@ function renderMermaidBlocks(){
     const id=block.dataset.mermaidId||('m-'+Math.random().toString(36).slice(2));
     try{
       const {svg}=await mermaid.render(id,code);
+      const tmp=document.getElementById('d'+id);
+      if(tmp) tmp.remove();
       block.innerHTML=svg;
       block.classList.add('mermaid-rendered');
     }catch(e){
-      // Fall back to showing as a code block
+      const tmp=document.getElementById('d'+id);
+      if(tmp) tmp.remove();
+      // Fall back to showing as a code block. Remove the mermaid marker so a
+      // later render pass cannot retry this already-failed block.
+      block.classList.remove('mermaid-block');
+      block.classList.add('prewrap');
       block.innerHTML=`<div class="pre-header">mermaid</div><pre><code>${esc(code)}</code></pre>`;
     }
   });
@@ -4116,6 +4754,12 @@ function _thinkingMarkup(text=''){
     : `<div class="thinking"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>`;
 }
 function finalizeThinkingCard(){
+  // Guard: only finalize thinking card if we're looking at the session that started it.
+  // Without this check, switching tabs while a stream is running causes finalizeThinkingCard
+  // to remove/modify the thinking card DOM of the wrong session — the card belongs to the
+  // stream that started it, not the session currently displayed.
+  const _guardTurn = $('liveAssistantTurn');
+  if(_guardTurn && S.session && _guardTurn.dataset.sessionId !== S.session.session_id) return;
   if(!isSimplifiedToolCalling()){
     const row=$('thinkingRow');
     if(!row) return;
@@ -4141,9 +4785,15 @@ function finalizeThinkingCard(){
   const turn=$('liveAssistantTurn');
   const group=turn&&turn.querySelector('.tool-call-group[data-live-tool-call-group="1"]');
   if(group){
-    group.classList.add('tool-call-group-collapsed');
-    const summary=group.querySelector('.tool-call-group-summary');
-    if(summary) summary.setAttribute('aria-expanded','false');
+    // Respect the user's explicit expand intent (#1298) — only force-collapse
+    // when the user has not manually expanded this turn's activity group, or
+    // has manually collapsed it. Otherwise the panel snaps shut whenever new
+    // activity arrives, even mid-read.
+    if(_liveActivityUserExpanded !== true){
+      group.classList.add('tool-call-group-collapsed');
+      const summary=group.querySelector('.tool-call-group-summary');
+      if(summary) summary.setAttribute('aria-expanded','false');
+    }
     const active=group.querySelector('.agent-activity-thinking[data-thinking-active="1"]');
     if(active) active.removeAttribute('data-thinking-active');
     _syncToolCallGroupSummary(group);
@@ -4159,6 +4809,7 @@ function appendThinking(text=''){
   if(!turn){
     turn=_createAssistantTurn();
     turn.id='liveAssistantTurn';
+    if(S.session) turn.dataset.sessionId=S.session.session_id;  // see #1366
     $('msgInner').appendChild(turn);
   }
   const blocks=_assistantTurnBlocks(turn);
@@ -4380,7 +5031,7 @@ function _renderTreeItems(container, entries, depth){
       };
       inp.onkeydown=(e2)=>{
         if(e2.key==='Enter'){
-          if(e2.isComposing){return;}
+          if(window._isImeEnter&&window._isImeEnter(e2)){return;}
           e2.preventDefault();
           finish(true);
         }
@@ -4646,7 +5297,7 @@ async function uploadPendingFiles(){
     fd.append('session_id',S.session.session_id);fd.append('file',f,f.name);
     try{
       const isArchive=_ARCHIVE_EXTS.test(f.name);
-      const url=new URL(isArchive?'api/upload/extract':'api/upload',location.href).href;
+      const url=new URL(isArchive?'api/upload/extract':'api/upload',document.baseURI||location.href).href;
       const res=await fetch(url,{method:'POST',credentials:'include',body:fd});
       if(_redirectIfUnauth(res)) return;
       if(!res.ok){const err=await res.text();throw new Error(err);}

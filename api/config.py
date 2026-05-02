@@ -614,6 +614,12 @@ _PROVIDER_ALIASES = {
     "nvidia-nim": "nvidia",
     "build-nvidia": "nvidia",
     "nemotron": "nvidia",
+    # Legacy alias — earlier WebUI builds wrote ``provider: local`` for unknown
+    # loopback endpoints, but ``local`` is not registered in
+    # ``hermes_cli.auth.PROVIDER_REGISTRY``. Routing it through ``custom``
+    # lets the agent's auxiliary client take the ``no-key-required``
+    # OpenAI-compat path. See #1384.
+    "local": "custom",
 }
 
 
@@ -880,23 +886,23 @@ def _apply_provider_prefix(
 def _deduplicate_model_ids(groups: list[dict]) -> None:
     """Ensure every model ID across groups is globally unique.
 
-    When multiple providers expose the same bare model ID (e.g. two
-    custom providers both listing ``gpt-5.4``), the dropdown cannot
-    distinguish them.  This post-process detects such collisions and
-    prefixes colliding entries with ``@provider_id:`` so the frontend
-    can treat them as distinct options.
+    When multiple providers expose the same model ID (either bare names like
+    ``gpt-5.4`` or slash-qualified IDs like ``google/gemma-4-27b``), the
+    dropdown cannot distinguish them. This post-process detects such
+    collisions and prefixes colliding entries with ``@provider_id:`` so the
+    frontend can treat them as distinct options.
 
-    The first occurrence (in group order) is left bare for backward
-    compatibility with sessions that already store the bare model name.
-    If that provider is later removed from the config, the next cache
-    rebuild re-runs dedup — the remaining provider becomes the sole
-    occurrence and is left bare, so the session still matches.
+    The first occurrence (in provider-id order) is left unchanged for backward
+    compatibility with sessions that already store the original bare/slash
+    model name. If that provider is later removed from the config, the next
+    cache rebuild re-runs dedup — the remaining provider becomes the sole
+    occurrence and is left unchanged, so the session still matches.
 
     .. note::
-       The "first occurrence wins" rule means the bare ID is not stable
+       The "first occurrence wins" rule means the unchanged ID is not stable
        across config changes (adding, removing, or reordering providers).
        This is acceptable because the dedup runs on every cache rebuild,
-       so sessions always resolve to the current canonical bare ID.
+       so sessions always resolve to the current canonical unchanged ID.
 
     The ``@provider_id:model`` format is consistent with the existing
     ``_apply_provider_prefix()`` function and is handled by
@@ -908,8 +914,8 @@ def _deduplicate_model_ids(groups: list[dict]) -> None:
     if not groups:
         return
 
-    # Collect {bare_id: [(group_idx, model_idx), ...]} in alphabetical
-    # provider_id order so that the "first occurrence stays bare" rule is
+    # Collect {model_id: [(group_idx, model_idx), ...]} in alphabetical
+    # provider_id order so that the "first occurrence stays unchanged" rule is
     # deterministic across config edits (adding/removing/reordering providers).
     sorted_group_indices = sorted(
         range(len(groups)),
@@ -918,34 +924,29 @@ def _deduplicate_model_ids(groups: list[dict]) -> None:
     id_map: dict[str, list[tuple[int, int]]] = {}
     for gi in sorted_group_indices:
         group = groups[gi]
-        pid = group.get("provider_id", "")
         for mi, model in enumerate(group.get("models", [])):
-            mid = model.get("id", "")
-            # Skip IDs that are already provider-qualified
-            if mid.startswith("@") or "/" in mid:
+            mid = str(model.get("id", "") or "").strip()
+            # Skip IDs that are already provider-qualified.
+            if not mid or mid.startswith("@"):
                 continue
             id_map.setdefault(mid, []).append((gi, mi))
 
-    # For any bare ID appearing in 2+ groups, prefix all but the first
-    # occurrence.  The first stays bare for backward compat; the rest
-    # get ``@provider_id:id`` and a disambiguated label.
+    # For any ID appearing in 2+ groups, prefix all but the first occurrence.
     # This handles N>2 providers correctly: the loop iterates over all
     # occurrences after the first, prefixing each with its own provider_id.
-    for bare_id, locations in id_map.items():
+    for original_id, locations in id_map.items():
         if len(locations) < 2:
             continue
-        # Prefix all occurrences after the first
         for gi, mi in locations[1:]:
             group = groups[gi]
             model = group["models"][mi]
             pid = group.get("provider_id", "")
-            model["id"] = f"@{pid}:{bare_id}"
+            model["id"] = f"@{pid}:{original_id}"
             provider_name = group.get("provider", pid)
-            # Update label to show provider for clarity
-            if model.get("label") != bare_id:
+            if model.get("label") != original_id:
                 model["label"] = f"{model['label']} ({provider_name})"
             else:
-                model["label"] = f"{bare_id} ({provider_name})"
+                model["label"] = f"{original_id} ({provider_name})"
 
 
 def resolve_model_provider(model_id: str) -> tuple:
@@ -975,6 +976,16 @@ def resolve_model_provider(model_id: str) -> tuple:
     if isinstance(model_cfg, dict):
         config_provider = model_cfg.get("provider")
         config_base_url = model_cfg.get("base_url")
+
+    # Heal legacy ``provider: local`` entries (written by WebUI < v0.50.252)
+    # at read time. ``local`` is not a registered provider, so passing it
+    # downstream raises a ``LOCAL_API_KEY`` error from the auxiliary client
+    # mid-conversation when compression/vision/web-extract fires. Route
+    # through ``custom`` instead — it takes the ``no-key-required``
+    # OpenAI-compat path that local servers (Ollama, LM Studio, llama.cpp,
+    # vLLM, TabbyAPI) actually use. See #1384.
+    if isinstance(config_provider, str) and config_provider.strip().lower() == "local":
+        config_provider = "custom"
 
     model_id = (model_id or "").strip()
     if not model_id:
@@ -1023,6 +1034,20 @@ def resolve_model_provider(model_id: str) -> tuple:
         _PORTAL_PROVIDERS = {"nous", "opencode-zen", "opencode-go", "nvidia"}
         if config_provider in _PORTAL_PROVIDERS:
             return model_id, config_provider, config_base_url
+        # The OpenAI Codex provider uses a real base_url, but its default
+        # ChatGPT endpoint cannot serve OpenRouter-style provider/model IDs.
+        # Keep that narrow exception before the custom endpoint protection so
+        # selecting openai/gpt-5.5 from OpenRouter under active Codex still
+        # routes through OpenRouter. Other base_url-backed real providers may be
+        # custom/proxy endpoints, so they must fall through to the branch below.
+        if (
+            config_provider == "openai-codex"
+            and str(config_base_url or "").strip().rstrip("/")
+            == "https://chatgpt.com/backend-api/codex"
+            and prefix in _PROVIDER_MODELS
+            and prefix != config_provider
+        ):
+            return model_id, "openrouter", None
         # If a custom endpoint base_url is configured, don't reroute through OpenRouter
         # just because the model name contains a slash (e.g. google/gemma-4-26b-a4b).
         # The user has explicitly pointed at a base_url, so trust their routing config.
@@ -1043,6 +1068,42 @@ def resolve_model_provider(model_id: str) -> tuple:
             return model_id, "openrouter", None
 
     return model_id, config_provider, config_base_url
+
+
+def model_with_provider_context(model_id: str, model_provider: str | None = None) -> str:
+    """Return the model string to pass to ``resolve_model_provider()``.
+
+    Session persistence keeps the user's selected provider in ``model_provider``
+    instead of forcing every selected model into ``@provider:model`` form. At
+    runtime, however, ``resolve_model_provider()`` still understands that
+    internal disambiguation form, so use it only when the provider context is
+    needed to route away from the current default provider.
+    """
+    model = str(model_id or "").strip()
+    provider = str(model_provider or "").strip().lower()
+    if not model or not provider or provider == "default" or model.startswith("@"):
+        return model
+
+    model_cfg = cfg.get("model", {})
+    config_provider = None
+    if isinstance(model_cfg, dict):
+        config_provider = str(model_cfg.get("provider") or "").strip().lower()
+
+    # If the selected provider is already the configured provider, leaving the
+    # model bare preserves provider-specific base_url/proxy settings.
+    if provider == config_provider:
+        return model
+
+    # OpenRouter selections with slash IDs are explicit provider/model paths.
+    if provider == "openrouter":
+        return f"@{provider}:{model}"
+
+    # For non-OpenRouter slash IDs, keep the ID intact so existing custom/proxy
+    # base_url routing and portal-provider handling remain in charge.
+    if "/" in model:
+        return model
+
+    return f"@{provider}:{model}"
 
 
 def get_effective_default_model(config_data: dict | None = None) -> str:
@@ -1190,6 +1251,13 @@ def set_hermes_default_model(model_id: str) -> dict:
         # matcher — see `static/panels.js` (#895).
         persisted_model = str(resolved_model or selected_model).strip()
         persisted_provider = str(resolved_provider or previous_provider or "").strip()
+        # Never persist the bogus ``local`` value — see #1384. The auto-detect
+        # block in ``_build_available_models_uncached`` was rewriting unknown
+        # loopback hosts to ``provider: "local"``, which is not registered and
+        # broke compression/vision mid-conversation. Route through ``custom``
+        # so the agent's auxiliary client uses the ``no-key-required`` path.
+        if persisted_provider.lower() == "local":
+            persisted_provider = "custom"
 
         model_cfg["default"] = persisted_model
         if persisted_provider:
@@ -1475,6 +1543,12 @@ def get_available_models() -> dict:
 
             option_ids = [m.get("id", "") for g in groups for m in g.get("models", []) if m.get("id")]
             option_lookup = {str(opt_id): str(opt_id) for opt_id in option_ids}
+            option_provider_lookup = {
+                str(m.get("id")): str(g.get("provider_id") or "")
+                for g in groups
+                for m in g.get("models", [])
+                if m.get("id")
+            }
             norm_lookup: dict[str, list[str]] = {}
             for opt_id in option_ids:
                 norm_lookup.setdefault(_norm_model_id(opt_id), []).append(opt_id)
@@ -1493,8 +1567,9 @@ def get_available_models() -> dict:
                         raw_candidates.append(candidate)
 
                 match_id = None
+                exact_match = next((option_lookup[c] for c in raw_candidates if c in option_lookup), None)
                 for candidate in raw_candidates:
-                    if candidate in option_lookup:
+                    if candidate in option_lookup and option_provider_lookup.get(candidate) == provider:
                         match_id = option_lookup[candidate]
                         break
                 if match_id is None:
@@ -1504,15 +1579,18 @@ def get_available_models() -> dict:
                         if not matches:
                             continue
                         provider_match = next(
-                            (m for m in matches if m.startswith(f"@{provider}:") or m.startswith(f"{provider}/")),
+                            (m for m in matches if option_provider_lookup.get(m) == provider),
                             None,
                         )
-                        match_id = provider_match or matches[0]
+                        match_id = provider_match or exact_match or matches[0]
                         if match_id:
                             break
 
                 badge_payload = {"role": entry["role"], "label": entry["label"], "provider": provider}
                 for candidate in raw_candidates:
+                    candidate_provider = option_provider_lookup.get(candidate)
+                    if candidate_provider and candidate_provider != provider:
+                        continue
                     badges[candidate] = badge_payload
                 if match_id:
                     badges[match_id] = badge_payload
@@ -1740,7 +1818,16 @@ def get_available_models() -> dict:
                             elif "lmstudio" in host or "lm-studio" in host:
                                 provider = "lmstudio"
                             else:
-                                provider = "local"
+                                # Unknown loopback/private endpoint: route through
+                                # the generic ``custom`` provider so the agent's
+                                # auxiliary client (compression, vision, web
+                                # extraction) takes the OpenAI-compat custom path
+                                # with ``no-key-required`` semantics. Writing
+                                # ``provider: local`` here used to break
+                                # compression mid-conversation because ``local``
+                                # is not a registered provider in
+                                # ``hermes_cli.auth.PROVIDER_REGISTRY`` — see #1384.
+                                provider = "custom"
                     except ValueError:
                         pass
 
@@ -1879,8 +1966,11 @@ def get_available_models() -> dict:
                             if _slug not in _named_custom_groups:
                                 _named_custom_groups[_slug] = (_cp_name, [])
                             detected_providers.add(_slug)
+                            _cp_option_id = _cp_model
+                            if active_provider != _slug and not _cp_option_id.startswith("@"):
+                                _cp_option_id = f"@{_slug}:{_cp_option_id}"
                             _named_custom_groups[_slug][1].append(
-                                {"id": _cp_model, "label": _cp_label}
+                                {"id": _cp_option_id, "label": _cp_label}
                             )
                         else:
                             auto_detected_models.append({"id": _cp_model, "label": _cp_label})
@@ -2110,6 +2200,8 @@ STREAMS_LOCK = threading.Lock()
 CANCEL_FLAGS: dict = {}
 AGENT_INSTANCES: dict = {}  # stream_id -> AIAgent instance for interrupt propagation
 STREAM_PARTIAL_TEXT: dict = {}  # stream_id -> partial assistant text accumulated during streaming
+STREAM_REASONING_TEXT: dict = {}  # stream_id -> reasoning trace accumulated during streaming (#1361 §A)
+STREAM_LIVE_TOOL_CALLS: dict = {}  # stream_id -> live tool calls accumulated during streaming (#1361 §B)
 SERVER_START_TIME = time.time()
 
 # Agent cache: reuse AIAgent across messages in the same WebUI session so that
@@ -2193,6 +2285,7 @@ _SETTINGS_DEFAULTS = {
     "notifications_enabled": False,  # browser notification when tab is in background
     "show_thinking": True,  # show/hide thinking/reasoning blocks in chat view
     "simplified_tool_calling": True,  # group tools/thinking into one quiet activity disclosure
+    "api_redact_enabled": True,  # redact sensitive data (API keys, secrets) from API responses
     "sidebar_density": "compact",  # compact | detailed
     "auto_title_refresh_every": "0",  # adaptive title refresh: 0=off, 5/10/20=every N exchanges
     "busy_input_mode": "queue",  # behavior when sending while agent is running: queue | interrupt | steer
@@ -2310,6 +2403,7 @@ _SETTINGS_BOOL_KEYS = {
     "notifications_enabled",
     "show_thinking",
     "simplified_tool_calling",
+    "api_redact_enabled",
 }
 # Language codes are validated as short alphanumeric BCP-47-like tags (e.g. 'en', 'zh', 'fr')
 _SETTINGS_LANG_RE = __import__("re").compile(r"^[a-zA-Z]{2,10}(-[a-zA-Z0-9]{2,8})?$")

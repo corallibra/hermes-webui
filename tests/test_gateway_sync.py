@@ -333,6 +333,9 @@ def test_compression_chain_collapses_to_latest_tip_in_sidebar():
         # bubbles to the top by true recency, not by the root's stale activity.
         # tip messages are at t0+201 and t0+202, so last_activity = t0 + 202.
         assert abs(tip.get('updated_at') - (t0 + 202)) < 0.01
+        assert tip.get('_lineage_root_id') == 'chain_root_001'
+        assert tip.get('_lineage_tip_id') == 'chain_tip_001'
+        assert tip.get('_compression_segment_count') == 3
 
         from api.agent_sessions import read_importable_agent_session_rows
 
@@ -722,6 +725,33 @@ def test_gateway_watcher_uses_normalized_source_metadata(monkeypatch):
             conn.close()
         except Exception:
             pass
+
+
+def test_imported_cli_session_metadata_survives_compact(cleanup_test_sessions):
+    """Imported agent sessions should remain distinguishable in compact sidebar payloads."""
+    from api.models import Session
+
+    sid = 'gw_imported_metadata_001'
+    cleanup_test_sessions.append(sid)
+    s = Session(
+        session_id=sid,
+        title='Imported Telegram Chat',
+        messages=[{'role': 'user', 'content': 'hello from telegram', 'timestamp': time.time()}],
+        model='openai/gpt-5',
+    )
+    s.is_cli_session = True
+    s.source_tag = 'telegram'
+    s.session_source = 'messaging'
+    s.source_label = 'Telegram'
+    s.save(touch_updated_at=False)
+
+    loaded = Session.load_metadata_only(sid)
+    compact = loaded.compact()
+
+    assert compact['is_cli_session'] is True
+    assert compact['source_tag'] == 'telegram'
+    assert compact['session_source'] == 'messaging'
+    assert compact['source_label'] == 'Telegram'
 
 
 def test_imported_cron_sessions_hidden_from_sidebar_by_default(cleanup_test_sessions):

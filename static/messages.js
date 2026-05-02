@@ -82,7 +82,7 @@ async function send(){
         S.pendingFiles=[];renderTray();
       } else if(busyMode==='interrupt'){
         // Queue the message, then cancel so drain re-sends it.
-        queueSessionMessage(S.session.session_id,{text,files:[...S.pendingFiles],model:S.session&&S.session.model||($('modelSelect')&&$('modelSelect').value)||'',profile:S.activeProfile||'default'});
+        queueSessionMessage(S.session.session_id,{text,files:[...S.pendingFiles],model:S.session&&S.session.model||($('modelSelect')&&$('modelSelect').value)||'',model_provider:S.session&&S.session.model_provider||null,profile:S.activeProfile||'default'});
         updateQueueBadge(S.session.session_id);
         $('msg').value='';autoResize();
         S.pendingFiles=[];renderTray();
@@ -95,7 +95,7 @@ async function send(){
       } else {
         // Default: queue mode (current behavior). Also the fallback for
         // 'steer' mode when no stream is active or _trySteer is unavailable.
-        queueSessionMessage(S.session.session_id,{text,files:[...S.pendingFiles],model:S.session&&S.session.model||($('modelSelect')&&$('modelSelect').value)||'',profile:S.activeProfile||'default'});
+        queueSessionMessage(S.session.session_id,{text,files:[...S.pendingFiles],model:S.session&&S.session.model||($('modelSelect')&&$('modelSelect').value)||'',model_provider:S.session&&S.session.model_provider||null,profile:S.activeProfile||'default'});
         $('msg').value='';autoResize();
         S.pendingFiles=[];renderTray();
         updateQueueBadge(S.session.session_id);
@@ -132,6 +132,18 @@ async function send(){
         $('msg').value='';autoResize();hideCmdDropdown();return;
       }
     }
+    if(_parsedCmd&&!_cmd){
+      const _agentCmd=typeof getAgentCommandMetadata==='function'
+        ? await getAgentCommandMetadata(_parsedCmd.name)
+        : null;
+      if(_agentCmd&&_agentCmd.cli_only){
+        if(!S.session){await newSession();await renderSessionList();}
+        S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
+        S.messages.push({role:'assistant',content:cliOnlyCommandResponse(_parsedCmd.name,_agentCmd),_ts:Date.now()/1000});
+        renderMessages();
+        $('msg').value='';autoResize();hideCmdDropdown();return;
+      }
+    }
   }
   if(!S.session){await newSession();await renderSessionList();}
 
@@ -141,6 +153,10 @@ async function send(){
   let uploaded=[];
   try{uploaded=await uploadPendingFiles();}
   catch(e){if(!text){setComposerStatus(`Upload error: ${e.message}`);return;}}
+  // Clear the uploading status now that upload is done — if we don't clear here
+  // it stays visible for the entire duration of the agent stream, since
+  // setComposerStatus('') is only called in setBusy(false), not setBusy(true).
+  setComposerStatus('');
 
   const uploadedNames=uploaded.map(u=>u.name||u);
   const uploadedPaths=uploaded.map(u=>u&&u.is_image?(u.name||u.filename||u):(u.path||u.name||u));
@@ -186,12 +202,21 @@ async function send(){
     const startData=await api('/api/chat/start',{method:'POST',body:JSON.stringify({
       session_id:activeSid,message:msgText,
       model:S.session.model||$('modelSelect').value,workspace:S.session.workspace,
+      model_provider:S.session.model_provider||null,
       attachments:uploaded.length?uploaded:undefined
     })});
     if(startData.effective_model && S.session){
       S.session.model=startData.effective_model;
+      S.session.model_provider=startData.effective_model_provider||S.session.model_provider||null;
       localStorage.setItem('hermes-webui-model', startData.effective_model);
-      if($('modelSelect')) _applyModelToDropdown(startData.effective_model, $('modelSelect'));
+      if(typeof _writePersistedModelState==='function') _writePersistedModelState(startData.effective_model,S.session.model_provider||null);
+      if($('modelSelect')) _applyModelToDropdown(startData.effective_model, $('modelSelect'),S.session.model_provider||null);
+      if(typeof syncTopbar==='function') syncTopbar();
+    }else if(startData.effective_model_provider && S.session){
+      S.session.model_provider=startData.effective_model_provider;
+      if(typeof _writePersistedModelState==='function') _writePersistedModelState(S.session.model||'',S.session.model_provider||null);
+      if($('modelSelect')&&typeof _applyModelToDropdown==='function') _applyModelToDropdown(S.session.model||'', $('modelSelect'), S.session.model_provider||null);
+      if(typeof syncModelChip==='function') syncModelChip();
       if(typeof syncTopbar==='function') syncTopbar();
     }
     streamId=startData.stream_id;
@@ -217,7 +242,7 @@ async function send(){
       stopApprovalPolling();
       stopClarifyPolling();
       // Keep the user's attempted turn by queueing it for after the current run.
-      queueSessionMessage(activeSid,{text:msgText,files:[],model:S.session&&S.session.model||($('modelSelect')&&$('modelSelect').value)||'',profile:S.activeProfile||'default'});
+      queueSessionMessage(activeSid,{text:msgText,files:[],model:S.session&&S.session.model||($('modelSelect')&&$('modelSelect').value)||'',model_provider:S.session&&S.session.model_provider||null,profile:S.activeProfile||'default'});
       updateQueueBadge(activeSid);
       showToast('Current session is still running. Reconnected and queued your message.',2600);
       try{
@@ -882,6 +907,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           queueSessionMessage(sid,{
             text:txt,files:[],
             model:S.session&&S.session.model||'',
+            model_provider:S.session&&S.session.model_provider||null,
             profile:S.activeProfile||'default',
           });
           if(typeof updateQueueBadge==='function') updateQueueBadge(sid);
@@ -993,7 +1019,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             const st=await api(`/api/chat/stream/status?stream_id=${encodeURIComponent(streamId)}`);
             if(st.active){
               setComposerStatus('Reconnected');
-              _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}`,location.href).href,{withCredentials:true}));
+              _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}`,document.baseURI||location.href).href,{withCredentials:true}));
               return;
             }
           }catch(_){}
@@ -1068,9 +1094,14 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         S.session=session;S.messages=(session.messages||[]).filter(m=>m&&m.role);
         const hasMessageToolMetadata=S.messages.some(m=>{
           if(!m||m.role!=='assistant') return false;
+          // Recognize both the standard `tool_calls` (used by completed assistant
+          // turns where the LLM emitted tool_call entries) and the WebUI-internal
+          // `_partial_tool_calls` (used on Stop/Cancel partial messages — see
+          // api/streaming.py cancel_stream).
           const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
+          const hasPartialTc=Array.isArray(m._partial_tool_calls)&&m._partial_tool_calls.length>0;
           const hasTu=Array.isArray(m.content)&&m.content.some(p=>p&&p.type==='tool_use');
-          return hasTc||hasTu;
+          return hasTc||hasPartialTc||hasTu;
         });
         if(!hasMessageToolMetadata&&session.tool_calls&&session.tool_calls.length){
           S.toolCalls=(session.tool_calls||[]).map(tc=>({...tc,done:true}));
@@ -1139,7 +1170,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         }
       }catch(_){}
     }
-    _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}`,location.href).href,{withCredentials:true}));
+    _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}`,document.baseURI||location.href).href,{withCredentials:true}));
   })();
 
 }
@@ -1314,6 +1345,50 @@ async function respondApproval(choice) {
 
 function startApprovalPolling(sid) {
   stopApprovalPolling();
+  // ── SSE (preferred): long-lived connection, server pushes instantly ──
+  try {
+    const es = new EventSource('/api/approval/stream?session_id=' + encodeURIComponent(sid));
+    let _fallbackActive = false;
+
+    es.addEventListener('initial', e => {
+      const d = JSON.parse(e.data);
+      if (d.pending) { d.pending._session_id = sid; showApprovalCard(d.pending, d.pending_count || 1); }
+      else { hideApprovalCard(); }
+    });
+
+    es.addEventListener('approval', e => {
+      const d = JSON.parse(e.data);
+      if (d.pending) { d.pending._session_id = sid; showApprovalCard(d.pending, d.pending_count || 1); }
+      else { hideApprovalCard(); }
+    });
+
+    es.onerror = () => {
+      // SSE failed — fall back to HTTP polling (3s interval)
+      if (_fallbackActive) return;
+      _fallbackActive = true;
+      try { es.close(); } catch(_){}
+      _startApprovalFallbackPoll(sid);
+    };
+
+    // If the session changes or stops being busy, close the SSE.
+    // We detect this via a periodic check (cheap — no network request).
+    _approvalSSEHealthTimer = setInterval(() => {
+      if (!S.busy || !S.session || S.session.session_id !== sid) {
+        stopApprovalPolling(); hideApprovalCard(true);
+      }
+    }, 5000);
+
+    _approvalEventSource = es;
+  } catch(_e) {
+    // EventSource constructor failed — use polling directly
+    _startApprovalFallbackPoll(sid);
+  }
+}
+
+let _approvalEventSource = null;
+let _approvalSSEHealthTimer = null;
+
+function _startApprovalFallbackPoll(sid) {
   _approvalPollTimer = setInterval(async () => {
     if (!S.busy || !S.session || S.session.session_id !== sid) {
       stopApprovalPolling(); hideApprovalCard(true); return;
@@ -1323,11 +1398,13 @@ function startApprovalPolling(sid) {
       if (data.pending) { data.pending._session_id=sid; showApprovalCard(data.pending, data.pending_count||1); }
       else { hideApprovalCard(); }
     } catch(e) { /* ignore poll errors */ }
-  }, 1500);
+  }, 1500);  // matches the v0.50.247 polling cadence so degraded-mode users see the same responsiveness
 }
 
 function stopApprovalPolling() {
   if (_approvalPollTimer) { clearInterval(_approvalPollTimer); _approvalPollTimer = null; }
+  if (_approvalEventSource) { try { _approvalEventSource.close(); } catch(_){} _approvalEventSource = null; }
+  if (_approvalSSEHealthTimer) { clearInterval(_approvalSSEHealthTimer); _approvalSSEHealthTimer = null; }
 }
 
 // ── Clarify polling ──
@@ -1622,10 +1699,70 @@ async function respondClarify(response) {
   } catch(e) { setStatus(t("clarify_responding") + " " + e.message); }
 }
 
+var _clarifyEventSource = null;
+var _clarifyFallbackTimer = null;
+var _clarifyHealthTimer = null;
+
 function startClarifyPolling(sid) {
   stopClarifyPolling();
   _clarifyMissingEndpointWarned = false;
-  _clarifyPollTimer = setInterval(async () => {
+
+  // SSE primary path: long-lived connection pushes events instantly.
+  try {
+    _clarifyEventSource = new EventSource('/api/clarify/stream?session_id=' + encodeURIComponent(sid));
+  } catch(e) {
+    _startClarifyFallbackPoll(sid);
+    return;
+  }
+
+  _clarifyEventSource.addEventListener('initial', function(ev) {
+    try {
+      var d = JSON.parse(ev.data);
+      if (d.pending) { d.pending._session_id = sid; showClarifyCard(d.pending); }
+      else { hideClarifyCard(false, 'expired'); }
+    } catch(e) {}
+  });
+
+  _clarifyEventSource.addEventListener('clarify', function(ev) {
+    try {
+      var d = JSON.parse(ev.data);
+      if (d.pending) { d.pending._session_id = sid; showClarifyCard(d.pending); }
+      else { hideClarifyCard(false, 'expired'); }
+    } catch(e) {}
+  });
+
+  _clarifyEventSource.onerror = function() {
+    stopClarifyPolling();
+    _startClarifyFallbackPoll(sid);
+  };
+
+  // Stale-detector: track last event timestamp; only reconnect if no event
+  // (initial or clarify) has arrived in 60s. The server sends a keepalive
+  // comment line every 30s but EventSource silently consumes those; we only
+  // bump lastEventAt on actual application events. With no real events for
+  // 60s on a long-lived clarify connection the server is effectively silent
+  // and a reconnect is the safe move.
+  //
+  // Without the lastEventAt gate the original PR force-reconnected every 60s
+  // regardless of activity, which churned one TCP/SSE setup per minute per
+  // active session. (Opus pre-release review of v0.50.249.)
+  let _lastClarifyEventAt = Date.now();
+  const _markClarifyEvent = () => { _lastClarifyEventAt = Date.now(); };
+  _clarifyEventSource.addEventListener('initial', _markClarifyEvent);
+  _clarifyEventSource.addEventListener('clarify', _markClarifyEvent);
+  _clarifyHealthTimer = setInterval(function() {
+    if (Date.now() - _lastClarifyEventAt < 60000) return;
+    if (_clarifyEventSource) {
+      try { _clarifyEventSource.close(); } catch(_){}
+      _clarifyEventSource = null;
+    }
+    clearInterval(_clarifyHealthTimer); _clarifyHealthTimer = null;
+    startClarifyPolling(sid);
+  }, 60000);
+}
+
+function _startClarifyFallbackPoll(sid) {
+  _clarifyFallbackTimer = setInterval(async () => {
     if (!S.session || S.session.session_id !== sid) {
       stopClarifyPolling(); hideClarifyCard(true, 'session'); return;
     }
@@ -1643,13 +1780,14 @@ function startClarifyPolling(sid) {
         }
         stopClarifyPolling();
       }
-      // Ignore transient poll errors; SSE clarify event still provides a fast path.
     }
-  }, 1500);
+  }, 3000);
 }
 
 function stopClarifyPolling() {
-  if (_clarifyPollTimer) { clearInterval(_clarifyPollTimer); _clarifyPollTimer = null; }
+  if (_clarifyEventSource) { try { _clarifyEventSource.close(); } catch(_){} _clarifyEventSource = null; }
+  if (_clarifyFallbackTimer) { clearInterval(_clarifyFallbackTimer); _clarifyFallbackTimer = null; }
+  if (_clarifyHealthTimer) { clearInterval(_clarifyHealthTimer); _clarifyHealthTimer = null; }
 }
 
 // ── Notifications and Sound ──────────────────────────────────────────────────
