@@ -1,5 +1,6 @@
 // ── Session action icons (SVG, monochrome, inherit currentColor) ──
 const ICONS={
+  stop:'<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" stroke="none"><rect x="4" y="4" width="8" height="8" rx="1.5"/></svg>',
   pin:'<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" stroke="none"><polygon points="8,1.5 9.8,5.8 14.5,6.2 11,9.4 12,14 8,11.5 4,14 5,9.4 1.5,6.2 6.2,5.8"/></svg>',
   unpin:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><polygon points="8,2 9.8,6.2 14.2,6.2 10.7,9.2 12,13.8 8,11 4,13.8 5.3,9.2 1.8,6.2 6.2,6.2"/></svg>',
   folder:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M2 4.5h4l1.5 1.5H14v7H2z"/></svg>',
@@ -286,12 +287,14 @@ async function newSession(flash){
   const newModelState=(canQualify&&typeof _modelStateForSelect==='function')
     ? _modelStateForSelect(modelSel,selectedDefaultModel)
     : {model:selectedDefaultModel,model_provider:null};
-  const data=await api('/api/session/new',{method:'POST',body:JSON.stringify({
+  const reqBody={
     model:newModelState.model,
     model_provider:newModelState.model_provider||null,
     workspace:inheritWs,
     profile:S.activeProfile||'default',
-  })});
+  };
+  if(_activeProject&&_activeProject!==NO_PROJECT_FILTER) reqBody.project_id=_activeProject;
+  const data=await api('/api/session/new',{method:'POST',body:JSON.stringify(reqBody)});
   S.session=data.session;S.messages=data.session.messages||[];
   S.lastUsage={...(data.session.last_usage||{})};
   if(flash)S.session._flash=true;
@@ -369,17 +372,35 @@ async function loadSession(sid){
     if (_loadingSessionId === sid) _loadingSessionId = null;
     return;
   }
+  // Guard: api() may have redirected (401) and returned undefined; in that case
+  // the browser is already navigating away, so abort the rest of this flow.
+  if (!data) {
+    if (_loadingSessionId === sid) _loadingSessionId = null;
+    return;
+  }
   // Stale response? A newer loadSession() call has already started (#1060).
   if (_loadingSessionId !== sid) return;
   S.session=data.session;
   S.session._modelResolutionDeferred=true;
   S.lastUsage={...(data.session.last_usage||{})};
+  // Sync workspace display immediately so the chip label reflects the new session's workspace
+  // before any async message-loading begins (mirrors how model is handled).
+  if(typeof syncTopbar==='function') syncTopbar();
   _setSessionViewedCount(S.session.session_id, Number(data.session.message_count || 0));
   _clearSessionCompletionUnread(S.session.session_id);
   localStorage.setItem('hermes-webui-session',S.session.session_id);
   _setActiveSessionUrl(S.session.session_id);
 
   const activeStreamId=S.session.active_stream_id||null;
+  // If the server says the session is idle, discard any browser-side inflight
+  // cache left behind by a crashed/restarted stream. Otherwise the UI can keep
+  // showing a permanent thinking/running state even though active_streams=0.
+  if(!activeStreamId&&INFLIGHT[sid]){
+    delete INFLIGHT[sid];
+    if(typeof clearInflightState==='function') clearInflightState(sid);
+    S.activeStreamId=null;
+    S.busy=false;
+  }
 
   // Phase 2a: If session is streaming, restore from INFLIGHT cache before
   // loading full messages (INFLIGHT state is self-contained and sufficient).
@@ -521,6 +542,339 @@ async function loadSession(sid){
   _resolveSessionModelForDisplaySoon(sid);
   // Clear the in-flight session marker now that this load has completed (#1060).
   if (_loadingSessionId === sid) _loadingSessionId = null;
+
+  // ── Cross-channel handoff hint ──
+  // After session fully loaded, check if this is a messaging session with
+  // enough conversation rounds to warrant a handoff hint bar.
+  if (S.session && _isMessagingSession(S.session)) {
+    _checkAndShowHandoffHint(sid);
+  } else {
+    _hideHandoffHint();
+  }
+}
+
+// ── Handoff hint logic ──────────────────────────────────────────────────────
+
+const _HANDOFF_THRESHOLD = 10;  // conversation rounds
+const _HANDOFF_STORAGE_PREFIX = 'handoff:';
+const _HANDOFF_SUFFIX_DISMISSED_AT = 'dismissed_at';
+const _HANDOFF_SUFFIX_SUMMARY_HANDLED_AT = 'summary_handled_at';
+const _MESSAGING_RAW_SOURCES = new Set(['weixin', 'telegram', 'discord', 'slack']);
+const _MESSAGING_SOURCE_LABELS = {
+  weixin: 'WeChat',
+  telegram: 'Telegram',
+  discord: 'Discord',
+  slack: 'Slack',
+};
+
+function _isMessagingSession(session) {
+  if (!session) return false;
+  // session_source is set by PR #1294 source normalization
+  if (session.session_source === 'messaging') return true;
+  // Fallback: check raw_source directly
+  const raw = (session.raw_source || session.source_tag || session.source || '').toLowerCase();
+  return _MESSAGING_RAW_SOURCES.has(raw);
+}
+
+function _normalizeMessageForCliImportComparison(message) {
+  if (!message || typeof message !== 'object') return message;
+  const clone = { ...message };
+  delete clone.timestamp;
+  delete clone._ts;
+  return clone;
+}
+
+function _isCliImportRefreshPrefixMatch(localMessages, freshMessages) {
+  if (!Array.isArray(localMessages) || !Array.isArray(freshMessages)) return false;
+  if (localMessages.length > freshMessages.length) return false;
+  for (let i = 0; i < localMessages.length; i += 1) {
+    if (JSON.stringify(_normalizeMessageForCliImportComparison(localMessages[i])) !== JSON.stringify(_normalizeMessageForCliImportComparison(freshMessages[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function _handoffStorageKey(sid) {
+  return `${_HANDOFF_STORAGE_PREFIX}${sid}:`;
+}
+
+function _getHandoffStorageValue(sid, suffix) {
+  try {
+    const raw = localStorage.getItem(_handoffStorageKey(sid) + suffix);
+    return raw ? parseFloat(raw) : null;
+  } catch { return null; }
+}
+
+function _setHandoffStorageValue(sid, suffix, ts) {
+  const key = _handoffStorageKey(sid) + suffix;
+  try {
+    if (!Number.isFinite(ts)) {
+      localStorage.removeItem(key);
+      return;
+    }
+    localStorage.setItem(key, String(ts));
+  } catch {}
+}
+
+function _clearHandoffStorageForSession(sid) {
+  if (!sid) return;
+  try {
+    _setHandoffStorageValue(sid, _HANDOFF_SUFFIX_DISMISSED_AT, null);
+    _setHandoffStorageValue(sid, _HANDOFF_SUFFIX_SUMMARY_HANDLED_AT, null);
+  } catch {}
+}
+
+function _getHandoffDismissedAt(sid) {
+  return _getHandoffStorageValue(sid, _HANDOFF_SUFFIX_DISMISSED_AT);
+}
+
+function _setHandoffDismissedAt(sid, ts) {
+  _setHandoffStorageValue(sid, _HANDOFF_SUFFIX_DISMISSED_AT, ts);
+}
+
+function _getHandoffSummaryHandledAt(sid) {
+  return _getHandoffStorageValue(sid, _HANDOFF_SUFFIX_SUMMARY_HANDLED_AT);
+}
+
+function _setHandoffSummaryHandledAt(sid, ts) {
+  _setHandoffStorageValue(sid, _HANDOFF_SUFFIX_SUMMARY_HANDLED_AT, ts);
+}
+
+function _getHandoffSince(sid) {
+  const dismissedAt = _getHandoffDismissedAt(sid);
+  const summaryHandledAt = _getHandoffSummaryHandledAt(sid);
+  if (Number.isFinite(dismissedAt) && Number.isFinite(summaryHandledAt)) return Math.max(dismissedAt, summaryHandledAt);
+  if (Number.isFinite(dismissedAt)) return dismissedAt;
+  if (Number.isFinite(summaryHandledAt)) return summaryHandledAt;
+  return null;
+}
+
+function _handoffMessagesEl() {
+  return document.getElementById('messages');
+}
+
+function _handoffIsMessagesNearBottom(el) {
+  if (!el) return false;
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 150;
+}
+
+function _syncHandoffDockSpace(open) {
+  const messages = _handoffMessagesEl();
+  if (!messages) return;
+  const wasNearBottom = _handoffIsMessagesNearBottom(messages);
+  if (!open) {
+    messages.classList.remove('handoff-dock-visible');
+    messages.style.removeProperty('--handoff-dock-height');
+    if (wasNearBottom && typeof scrollToBottom === 'function') requestAnimationFrame(scrollToBottom);
+    return;
+  }
+  messages.classList.add('handoff-dock-visible');
+  const measure = () => {
+    const container = $('handoffHintContainer');
+    const h = container && container.getBoundingClientRect().height;
+    if (h > 0) messages.style.setProperty('--handoff-dock-height', Math.ceil(h + 24) + 'px');
+    if (wasNearBottom && typeof scrollToBottom === 'function') scrollToBottom();
+  };
+  requestAnimationFrame(measure);
+  setTimeout(measure, 360);
+}
+
+function _getChannelLabel(session) {
+  if (!session) return '';
+  // Use source_label from PR #1294 if available
+  if (session.source_label) return session.source_label;
+  const raw = (session.raw_source || session.source_tag || session.source || '').toLowerCase();
+  return _MESSAGING_SOURCE_LABELS[raw] || raw || '';
+}
+
+async function _checkAndShowHandoffHint(sid) {
+  try {
+    const since = _getHandoffSince(sid);
+    const body = { session_id: sid };
+    if (since != null) body.since = since;
+
+    const result = await api('/api/session/conversation-rounds', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+    // Stale? Session switched while we were fetching.
+    if (!S.session || S.session.session_id !== sid) return;
+
+    if (result && result.ok && result.should_show) {
+      _showHandoffHint(sid, result.rounds);
+    } else {
+      const container = $('handoffHintContainer');
+      const isSameVisibleSession = !!(
+        container &&
+        container.classList.contains('is-visible') &&
+        container.dataset.sessionId === String(sid)
+      );
+      if (!isSameVisibleSession) _hideHandoffHint();
+    }
+  } catch (e) {
+    console.warn('Handoff hint check failed:', e);
+    _hideHandoffHint();
+  }
+}
+
+function _showHandoffHint(sid, rounds) {
+  const container = $('handoffHintContainer');
+  if (!container) return;
+
+  // Clear any existing content.
+  container.innerHTML = '';
+  container.style.display = '';
+  container.classList.add('is-visible');
+  container.dataset.sessionId = String(sid);
+
+  const channel = _getChannelLabel(S.session);
+  const hintText = channel
+    ? `${channel} handoff`
+    : `Conversation handoff`;
+  const hintMeta = `${rounds} new conversation rounds`;
+
+  const bar = document.createElement('div');
+  bar.className = 'handoff-hint-bar';
+  bar.id = 'handoffHintBar';
+  bar.innerHTML = `
+    <div class="handoff-hint-text">
+      <span class="handoff-hint-dot" aria-hidden="true"></span>
+      <span class="handoff-hint-label">${esc(hintText)}</span>
+      <span class="handoff-hint-meta">${esc(hintMeta)}</span>
+    </div>
+    <div class="handoff-hint-actions">
+      <button class="handoff-hint-action" type="button">View summary</button>
+      <button class="handoff-hint-dismiss" type="button" onclick="event.stopPropagation(); _dismissHandoffHint('${esc(sid)}')" title="Dismiss">
+        Close
+      </button>
+    </div>
+  `;
+
+  // Click on the bar (not the explicit close button) triggers summary generation.
+  bar.addEventListener('click', (e) => {
+    if (e.target.closest('.handoff-hint-dismiss')) return;
+    _generateHandoffSummary(sid, rounds);
+  });
+
+  container.appendChild(bar);
+  _syncHandoffDockSpace(true);
+}
+
+function _hideHandoffHint() {
+  const container = $('handoffHintContainer');
+  if (container) {
+    container.innerHTML = '';
+    container.style.display = 'none';
+    container.classList.remove('is-visible');
+    delete container.dataset.sessionId;
+  }
+  _syncHandoffDockSpace(false);
+}
+
+function _dismissHandoffHint(sid) {
+  _setHandoffDismissedAt(sid, Date.now() / 1000);
+  _hideHandoffHint();
+}
+
+function _buildHandoffSummaryToolMessage(summary, channel, rounds, fallback) {
+  const generatedAt = Date.now() / 1000;
+  return {
+    role: 'tool',
+    tool_call_id: '',
+    name: 'handoff_summary',
+    timestamp: generatedAt,
+    _ts: generatedAt,
+    content: JSON.stringify({
+      _handoff_summary_card: true,
+      session_id: sidValue(),
+      summary: String(summary || '').trim(),
+      channel: (typeof channel === 'string' && channel.trim()) ? channel.trim() : null,
+      rounds: Number.isFinite(rounds) ? rounds : null,
+      fallback: !!fallback,
+      generated_at: generatedAt,
+    }),
+  };
+}
+
+function sidValue() {
+  return S && S.session && S.session.session_id ? S.session.session_id : null;
+}
+
+function _extractHandoffSummaryPayload(content){
+  if(!content) return null;
+  if(typeof content!=='string') return null;
+  try {
+    const parsed=JSON.parse(content);
+    return parsed&&typeof parsed==='object'&&parsed._handoff_summary_card===true?parsed:null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function _generateHandoffSummary(sid, rounds) {
+  // Treat handoff like a slash-command result: the composer dock entry
+  // disappears and the transient summary card renders in the transcript.
+  _hideHandoffHint();
+  const channel = _getChannelLabel(S.session);
+  if (typeof setHandoffUi === 'function') {
+    setHandoffUi({
+      sessionId: sid,
+      phase: 'running',
+      channel,
+      rounds,
+    });
+  }
+
+  try {
+    const since = _getHandoffSince(sid);
+    const body = { session_id: sid };
+    if (since != null) body.since = since;
+
+    const result = await api('/api/session/handoff-summary', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+    const isSuccess = result && result.ok && result.summary;
+    if (isSuccess) {
+      _setHandoffSummaryHandledAt(sid, Date.now() / 1000);
+      _setHandoffDismissedAt(sid, null);
+      const marker=_buildHandoffSummaryToolMessage(result.summary, channel, result.rounds || rounds, !!result.fallback);
+      if (S.session && S.session.session_id === sid) {
+        S.messages = [...S.messages, marker];
+        if (typeof renderMessages === 'function') renderMessages();
+      }
+      if (typeof setHandoffUi === 'function') {
+        setHandoffUi(null);
+      }
+    } else if (S.session && S.session.session_id === sid && typeof setHandoffUi === 'function') {
+      // Keep transient card while the user can retry the action.
+      setHandoffUi({
+        sessionId: sid,
+        phase: 'error',
+        channel,
+        rounds,
+        errorText: 'Could not generate summary. Please try again.',
+      });
+    } else {
+      // Stale session response path: only record success baseline.
+    }
+  } catch (e) {
+    console.warn('Handoff summary failed:', e);
+    if (S.session && S.session.session_id === sid && typeof setHandoffUi === 'function') {
+      setHandoffUi({
+        sessionId: sid,
+        phase: 'error',
+        channel,
+        rounds,
+        errorText: 'Summary generation failed: ' + e.message,
+      });
+    }
+  }
+
+  // If generation succeeds, set a baseline so only new activity after that time
+  // can re-trigger handoff prompts. Failures keep the hint active so users can
+  // retry.
 }
 
 function _resolveSessionModelForDisplaySoon(sid){
@@ -561,6 +915,8 @@ async function _ensureMessagesLoaded(sid) {
   }
   // Fetch session messages with a tail window for fast initial load.
   const data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_limit=${_INITIAL_MSG_LIMIT}`);
+  // Guard: api() may have redirected (401) and returned undefined.
+  if (!data || !data.session) return;
   _messagesTruncated = !!data.session._messages_truncated;
   _oldestIdx = data.session._messages_offset || 0;
   const msgs = (data.session.messages || []).filter(m => m && m.role);
@@ -601,7 +957,8 @@ async function _loadOlderMessages() {
   _loadingOlder = true;
   try {
     const data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_before=${_oldestIdx}&msg_limit=${_INITIAL_MSG_LIMIT}`);
-    // Cancellation guards:
+    // Guard: api() may have redirected (401) and returned undefined.
+    if (!data || !data.session) { _loadingOlder = false; return; }
     //  - response shape sane
     //  - the active session is still the one we issued the request for.
     //    Compare against S.session.session_id, NOT _loadingSessionId — the
@@ -646,6 +1003,8 @@ async function _ensureAllMessagesLoaded() {
   if (!_messagesTruncated || !S.session) return;
   const sid = S.session.session_id;
   const data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0`);
+  // Guard: api() may have redirected (401) and returned undefined.
+  if (!data || !data.session) return;
   const msgs = (data.session.messages || []).filter(m => m && m.role);
   S.messages = msgs;
   _messagesTruncated = false;
@@ -660,11 +1019,19 @@ let _showArchived = false;  // toggle to show archived sessions
 let _sessionSelectMode = false;  // batch select mode
 const _selectedSessions = new Set();  // selected session IDs
 let _allProjects = [];  // cached project list
-let _activeProject = null;  // project_id filter (null = show all)
+// Sentinel value for the _activeProject state when filtering to sessions
+// that have no project_id assigned. Distinct from real project IDs so the
+// equality check below can branch cleanly on it. The literal string is
+// not user-visible (the chip renders the localized label) — it just has
+// to be something a user-created project_id can never collide with, which
+// double-underscore prefixes provide.
+const NO_PROJECT_FILTER = '__none__';
+let _activeProject = null;  // project_id filter (null = show all, NO_PROJECT_FILTER = unassigned only)
 let _showAllProfiles = false;  // false = filter to active profile only
 let _sessionActionMenu = null;
 let _sessionActionAnchor = null;
 let _sessionActionSessionId = null;
+const _expandedChildSessionKeys = new Set();
 
 function _sessionIdFromLocation(){
   if(typeof window==='undefined'||!window.location) return null;
@@ -697,7 +1064,7 @@ function _setActiveSessionUrl(sid){
   if(typeof window==='undefined'||!window.history||!sid) return;
   const next=_sessionUrlForSid(sid);
   if(next && next!==(window.location.pathname+window.location.search+window.location.hash)){
-    window.history.replaceState({session_id:sid},'',next);
+    window.history.pushState({session_id:sid},'',next);
   }
 }
 
@@ -722,6 +1089,14 @@ function toggleSessionSelect(sid){
   const item=cb?cb.closest('.session-item'):null;
   if(item){item.classList.toggle('selected',_selectedSessions.has(sid));if(cb)cb.checked=_selectedSessions.has(sid);}
 }
+function setSessionSelected(sid, selected){
+  if(selected) _selectedSessions.add(sid);
+  else _selectedSessions.delete(sid);
+  _updateBatchActionBar();
+  const cb=document.querySelector('.session-select-cb[data-sid="'+sid+'"]');
+  const item=cb?cb.closest('.session-item'):null;
+  if(item){item.classList.toggle('selected',_selectedSessions.has(sid));if(cb)cb.checked=_selectedSessions.has(sid);}
+}
 function selectAllSessions(){
   _selectedSessions.clear();
   document.querySelectorAll('.session-select-cb').forEach(cb=>{
@@ -738,13 +1113,12 @@ function deselectAllSessions(){
 function _updateBatchActionBar(){
   const bar=$('batchActionBar');if(!bar)return;
   const count=_selectedSessions.size;
-  bar.style.display=count>0?'':'none';
-  const badge=bar.querySelector('.batch-count');
-  if(badge) badge.textContent=t('session_selected_count',count);
+  if(count>0){_renderBatchActionBar();}
+  else{bar.style.display='none';}
 }
 function _renderBatchActionBar(){
   const bar=$('batchActionBar');if(!bar)return;
-  bar.innerHTML='';bar.style.display=_selectedSessions.size>0?'':'none';
+  bar.innerHTML='';bar.style.display=_selectedSessions.size>0?'flex':'none';
   const countBadge=document.createElement('span');countBadge.className='batch-count';
   countBadge.textContent=t('session_selected_count',_selectedSessions.size);bar.appendChild(countBadge);
   // Archive
@@ -761,7 +1135,7 @@ function _renderBatchActionBar(){
   // Move
   const moveBtn=document.createElement('button');moveBtn.className='batch-action-btn';
   moveBtn.textContent=t('session_batch_move');
-  moveBtn.onclick=()=>{_showBatchProjectPicker();};bar.appendChild(moveBtn);
+  moveBtn.onclick=(e)=>{e.stopPropagation();_showBatchProjectPicker();};bar.appendChild(moveBtn);
   // Delete
   const deleteBtn=document.createElement('button');deleteBtn.className='batch-action-btn batch-action-btn-danger';
   deleteBtn.textContent=t('session_batch_delete');
@@ -769,7 +1143,9 @@ function _renderBatchActionBar(){
     const ids=[..._selectedSessions];
     const ok=await showConfirmDialog({message:t('session_batch_delete_confirm',ids.length),confirmLabel:t('delete_title'),danger:true});
     if(!ok)return;
-    try{await Promise.all(ids.map(sid=>api('/api/session/delete',{method:'POST',body:JSON.stringify({session_id:sid})})));
+    try{
+      await Promise.all(ids.map(sid=>api('/api/session/delete',{method:'POST',body:JSON.stringify({session_id:sid})})));
+      ids.forEach(_clearHandoffStorageForSession);
       if(S.session&&ids.includes(S.session.session_id)){
         S.session=null;S.messages=[];S.entries=[];localStorage.removeItem('hermes-webui-session');
         const remaining=await api('/api/sessions');
@@ -782,8 +1158,9 @@ function _renderBatchActionBar(){
 }
 function _showBatchProjectPicker(){
   const ids=[..._selectedSessions];if(!ids.length)return;
-  document.querySelectorAll('.project-picker').forEach(p=>p.remove());
-  const picker=document.createElement('div');picker.className='project-picker';
+  const bar=$('batchActionBar');if(!bar)return;
+  bar.querySelectorAll('.batch-project-picker').forEach(p=>p.remove());
+  const picker=document.createElement('div');picker.className='project-picker batch-project-picker';
   const none=document.createElement('div');none.className='project-picker-item';none.textContent='No project';
   none.onclick=async()=>{picker.remove();
     try{await Promise.all(ids.map(sid=>api('/api/session/move',{method:'POST',body:JSON.stringify({session_id:sid,project_id:null})})));
@@ -801,7 +1178,7 @@ function _showBatchProjectPicker(){
       }catch(e){showToast('Move failed: '+(e.message||e));}
     };picker.appendChild(item);
   }
-  document.body.appendChild(picker);picker.style.cssText='position:fixed;bottom:60px;left:50%;transform:translateX(-50%);z-index:999;';
+  bar.appendChild(picker);
   const close=(e)=>{if(!picker.contains(e.target)){picker.remove();document.removeEventListener('click',close);}};
   setTimeout(()=>document.addEventListener('click',close),0);
 }
@@ -858,12 +1235,32 @@ function _buildSessionAction(label, meta, icon, onSelect, extraClass=''){
   return opt;
 }
 
+function _appendSessionDuplicateAction(menu, session){
+  menu.appendChild(_buildSessionAction(
+    t('session_duplicate'),
+    t('session_duplicate_desc'),
+    ICONS.dup,
+    async()=>{
+      closeSessionActionMenu();
+      try{
+        const res=await api('/api/session/duplicate',{method:'POST',body:JSON.stringify({session_id:session.session_id})});
+        if(res.session){
+          await loadSession(res.session.session_id);
+          await renderSessionList();
+          showToast(t('session_duplicated'));
+        }
+      }catch(err){showToast(t('session_duplicate_failed')+err.message);}
+    }
+  ));
+}
+
 function _openSessionActionMenu(session, anchorEl){
   if(_sessionActionMenu && _sessionActionSessionId===session.session_id && _sessionActionAnchor===anchorEl){
     closeSessionActionMenu();
     return;
   }
   closeSessionActionMenu();
+  const isMessagingSession = _isMessagingSession(session);
   const menu=document.createElement('div');
   menu.className='session-action-menu open';
   menu.appendChild(_buildSessionAction(
@@ -906,33 +1303,33 @@ function _openSessionActionMenu(session, anchorEl){
       }catch(err){showToast(t('session_archive_failed')+err.message);}
     }
   ));
-  menu.appendChild(_buildSessionAction(
-    t('session_duplicate'),
-    t('session_duplicate_desc'),
-    ICONS.dup,
-    async()=>{
-      closeSessionActionMenu();
-      try{
-        const res=await api('/api/session/new',{method:'POST',body:JSON.stringify({workspace:session.workspace,model:session.model,model_provider:session.model_provider||null})});
-        if(res.session){
-          await api('/api/session/rename',{method:'POST',body:JSON.stringify({session_id:res.session.session_id,title:(session.title||'Untitled')+' (copy)'})});
-          await loadSession(res.session.session_id);
-          await renderSessionList();
-          showToast(t('session_duplicated'));
-        }
-      }catch(err){showToast(t('session_duplicate_failed')+err.message);}
-    }
-  ));
-  menu.appendChild(_buildSessionAction(
-    t('session_delete'),
-    t('session_delete_desc'),
-    ICONS.trash,
-    async()=>{
-      closeSessionActionMenu();
-      await deleteSession(session.session_id);
-    },
-    'danger'
-  ));
+  if(!isMessagingSession){
+    _appendSessionDuplicateAction(menu, session);
+  }
+  if(session.active_stream_id){
+    menu.appendChild(_buildSessionAction(
+      t('session_stop_response'),
+      t('session_stop_response_desc'),
+      ICONS.stop,
+      async()=>{
+        closeSessionActionMenu();
+        await cancelSessionStream(session);
+        showToast(t('stream_stopped'));
+      }
+    ));
+  }
+  if(!isMessagingSession){
+    menu.appendChild(_buildSessionAction(
+      t('session_delete'),
+      t('session_delete_desc'),
+      ICONS.trash,
+      async()=>{
+        closeSessionActionMenu();
+        await deleteSession(session.session_id);
+      },
+      'danger'
+    ));
+  }
   document.body.appendChild(menu);
   _sessionActionMenu = menu;
   _sessionActionAnchor = anchorEl;
@@ -1092,7 +1489,10 @@ function startGatewaySSE(){
                   if(!S.session || S.session.session_id !== activeSid) return;
                   if(res && res.session && Array.isArray(res.session.messages)){
                     const prev = S.messages.length;
-                    S.messages = res.session.messages.filter(m=>m&&m.role);
+                    const next = res.session.messages.filter(m => m && m.role);
+                    if (next.length < prev) return;
+                    if (prev > 0 && !_isCliImportRefreshPrefixMatch(S.messages, next)) return;
+                    S.messages = next;
                     if(S.messages.length !== prev){
                       renderMessages();
                       if(typeof highlightCode==='function') highlightCode();
@@ -1264,8 +1664,13 @@ function _sessionTimeBucketLabel(timestampMs, nowMs) {
   return t('session_time_bucket_older');
 }
 
+function _isChildSession(s){
+  return !!(s&&s.parent_session_id&&s.relationship_type==='child_session');
+}
+
 function _sessionLineageKey(s, sessionIdsInList){
   if(!s||!s.session_id) return null;
+  if(_isChildSession(s)) return null;
   // If parent_session_id points to another session in the current list,
   // this is a subagent child — don't collapse it into lineage (#494).
   if(s.parent_session_id && sessionIdsInList && sessionIdsInList.has(s.parent_session_id)){
@@ -1277,8 +1682,68 @@ function _sessionLineageKey(s, sessionIdsInList){
 function _sessionLineageContainsSession(s, sid){
   if(!s||!sid) return false;
   if(s.session_id===sid) return true;
-  if(!Array.isArray(s._lineage_segments)) return false;
-  return s._lineage_segments.some(seg=>seg&&seg.session_id===sid);
+  if(Array.isArray(s._lineage_segments)&&s._lineage_segments.some(seg=>seg&&seg.session_id===sid)) return true;
+  if(Array.isArray(s._child_sessions)&&s._child_sessions.some(child=>child&&child.session_id===sid)) return true;
+  return false;
+}
+
+function _sidebarLineageKeyForRow(s){
+  if(!s) return null;
+  return s._lineage_key||s._lineage_root_id||s.lineage_root_id||s.parent_session_id||s.session_id||null;
+}
+
+function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions){
+  const rows=(collapsedRows||[]).filter(s=>!_isChildSession(s)).map(s=>({...s}));
+  const visibleBySid=new Map();
+  const visibleBySegmentSid=new Map();
+  const visibleByLineageKey=new Map();
+  for(const row of rows){
+    if(row&&row.session_id) visibleBySid.set(row.session_id,row);
+    const lineageKey=_sidebarLineageKeyForRow(row);
+    if(lineageKey&&!visibleByLineageKey.has(lineageKey)) visibleByLineageKey.set(lineageKey,row);
+    for(const seg of (Array.isArray(row._lineage_segments)?row._lineage_segments:[])){
+      if(seg&&seg.session_id) visibleBySegmentSid.set(seg.session_id,{row,seg});
+    }
+  }
+  const orphans=[];
+  for(const child of rawSessions||[]){
+    if(!_isChildSession(child)) continue;
+    const parentSid=child.parent_session_id;
+    let parentRow=visibleBySid.get(parentSid);
+    let parentSegment=null;
+    if(!parentRow&&visibleBySegmentSid.has(parentSid)){
+      const resolved=visibleBySegmentSid.get(parentSid);
+      parentRow=resolved.row;
+      parentSegment=resolved.seg;
+    }
+    if(!parentRow&&child._parent_lineage_root_id){
+      parentRow=visibleByLineageKey.get(child._parent_lineage_root_id)||null;
+    }
+    if(parentRow){
+      if(!Array.isArray(parentRow._child_sessions)) parentRow._child_sessions=[];
+      const childCopy={...child};
+      if(parentSegment){
+        childCopy._parent_segment_id=parentSegment.session_id;
+        childCopy._parent_segment_title=parentSegment.title||child.parent_title||'Untitled';
+      }
+      parentRow._child_sessions.push(childCopy);
+      parentRow._child_session_count=parentRow._child_sessions.length;
+    } else {
+      orphans.push({...child,_orphan_child_session:true});
+    }
+  }
+  return [...rows,...orphans];
+}
+
+function _syncSidebarExpansionForActiveSession(rows, activeSid){
+  if(!activeSid) return;
+  for(const row of rows||[]){
+    const key=_sidebarLineageKeyForRow(row);
+    if(!key) continue;
+    if(Array.isArray(row._child_sessions)&&row._child_sessions.some(child=>child&&child.session_id===activeSid)){
+      _expandedChildSessionKeys.add(key);
+    }
+  }
 }
 
 function _collapseSessionLineageForSidebar(sessions){
@@ -1291,11 +1756,11 @@ function _collapseSessionLineageForSidebar(sessions){
     if(!groups.has(key)) groups.set(key,[]);
     groups.get(key).push(s);
   }
-  for(const items of groups.values()){
+  for(const [key,items] of groups.entries()){
     if(items.length<=1){result.push(items[0]);continue;}
     const sorted=[...items].sort((a,b)=>_sessionTimestampMs(b)-_sessionTimestampMs(a));
     const chosen=sorted[0];
-    result.push({...chosen,_lineage_collapsed_count:items.length,_lineage_segments:sorted});
+    result.push({...chosen,_lineage_key:key,_lineage_collapsed_count:items.length,_lineage_segments:sorted});
   }
   return result;
 }
@@ -1304,6 +1769,60 @@ function _activeSessionIdForSidebar(){
   if(S.session&&S.session.session_id) return S.session.session_id;
   if(typeof _sessionIdFromLocation==='function') return _sessionIdFromLocation();
   return null;
+}
+
+function upsertActiveSessionForLocalTurn({title='', messageCount=0, timestampMs=Date.now()}={}){
+  if(!S.session||!S.session.session_id) return;
+  const sid=S.session.session_id;
+  const nowSec=Math.floor((Number(timestampMs)||Date.now())/1000);
+  const localCount=Array.isArray(S.messages)?S.messages.length:0;
+  const count=Math.max(Number(S.session.message_count||0),Number(messageCount||0),localCount,1);
+  S.session.message_count=count;
+  S.session.last_message_at=nowSec;
+  S.session.updated_at=nowSec;
+  if((S.session.title==='Untitled'||!S.session.title)&&title){
+    S.session.title=title;
+  }
+  const existingIdx=_allSessions.findIndex(s=>s&&s.session_id===sid);
+  const row={
+    ...S.session,
+    session_id:sid,
+    title:S.session.title||title||'New chat',
+    message_count:count,
+    last_message_at:nowSec,
+    updated_at:nowSec,
+    profile:S.session.profile||S.activeProfile||'default',
+    is_streaming:true,
+  };
+  if(existingIdx>=0) _allSessions[existingIdx]={..._allSessions[existingIdx],...row};
+  else _allSessions.unshift(row);
+  renderSessionListFromCache();
+}
+
+function clearOptimisticSessionStreaming(sid){
+  sid=sid||(S.session&&S.session.session_id)||'';
+  if(!sid) return;
+  if(S.session&&S.session.session_id===sid){
+    S.session.active_stream_id=null;
+    S.activeStreamId=null;
+  }
+  if(Array.isArray(_allSessions)){
+    const idx=_allSessions.findIndex(s=>s&&s.session_id===sid);
+    if(idx>=0){
+      _allSessions[idx]={
+        ..._allSessions[idx],
+        active_stream_id:null,
+        pending_user_message:null,
+        pending_started_at:null,
+        is_streaming:false,
+      };
+    }
+  }
+  if(typeof _sessionStreamingById!=='undefined'&&_sessionStreamingById&&typeof _sessionStreamingById.set==='function'){
+    _sessionStreamingById.set(sid,false);
+  }
+  if(typeof _forgetObservedStreamingSession==='function') _forgetObservedStreamingSession(sid);
+  renderSessionListFromCache();
 }
 
 function renderSessionListFromCache(){
@@ -1320,33 +1839,29 @@ function renderSessionListFromCache(){
   // real once the first message is sent. The server already filters them, but this
   // guard ensures a brand-new active session doesn't flash into the list while
   // _allSessions is stale from a prior render (#1171).
-  const withMessages=allMatched.filter(s=>(s.message_count||0)>0 || (activeSidForSidebar&&s.session_id===activeSidForSidebar) || (S.session&&s.session_id===S.session.session_id&&(S.session.message_count||0)>0));
+  const withMessages=allMatched.filter(s=>
+    (s.message_count||0)>0 ||
+    _isSessionEffectivelyStreaming(s) ||
+    !!s.active_stream_id ||
+    !!s.pending_user_message ||
+    (activeSidForSidebar&&s.session_id===activeSidForSidebar) ||
+    (S.session&&s.session_id===S.session.session_id&&(S.session.message_count||0)>0)
+  );
   // Filter by active profile (unless "All profiles" is toggled on)
   // Server backfills profile='default' for legacy sessions, so every session has a profile.
   // Show only sessions tagged to the active profile; 'All profiles' toggle overrides.
   const profileFiltered=_showAllProfiles?withMessages:withMessages.filter(s=>s.is_cli_session||s.profile===S.activeProfile);
-  // Filter by active project
-  const projectFiltered=_activeProject?profileFiltered.filter(s=>s.project_id===_activeProject):profileFiltered;
+  // Filter by active project. NO_PROJECT_FILTER sentinel asks for sessions
+  // with no project_id; otherwise filter to the matching project_id, or
+  // pass through when no filter is active.
+  const projectFiltered=
+    _activeProject===NO_PROJECT_FILTER
+      ?profileFiltered.filter(s=>!s.project_id)
+      :(_activeProject?profileFiltered.filter(s=>s.project_id===_activeProject):profileFiltered);
   // Filter archived unless toggle is on
   const sessionsRaw=_showArchived?projectFiltered:projectFiltered.filter(s=>!s.archived);
-  const sessions=_collapseSessionLineageForSidebar(sessionsRaw);
-  // Build parent→children map for subagent tree (#494).
-  // Only children whose parent exists in the current (post-collapse) list are grouped.
-  const _sessionIdsInList=new Set(sessions.map(s=>s.session_id));
-  const _parentChildrenMap=new Map();
-  const _topLevelSessions=[];
-  for(const s of sessions){
-    if(s.parent_session_id && _sessionIdsInList.has(s.parent_session_id)){
-      if(!_parentChildrenMap.has(s.parent_session_id)) _parentChildrenMap.set(s.parent_session_id,[]);
-      _parentChildrenMap.get(s.parent_session_id).push(s);
-    } else {
-      _topLevelSessions.push(s);
-    }
-  }
-  // Collapse state for subagent tree groups — persisted in localStorage (#494)
-  let _treeCollapsed={};
-  try{_treeCollapsed=JSON.parse(localStorage.getItem('hermes-tree-collapsed')||'{}');}catch(e){}
-  const _saveTreeCollapsed=()=>{try{localStorage.setItem('hermes-tree-collapsed',JSON.stringify(_treeCollapsed));}catch(e){}};
+  const sessions=_attachChildSessionsToSidebarRows(_collapseSessionLineageForSidebar(sessionsRaw), sessionsRaw);
+  _syncSidebarExpansionForActiveSession(sessions, activeSidForSidebar);
   const archivedCount=projectFiltered.filter(s=>s.archived).length;
   const list=$('sessionList');list.innerHTML='';
   // Batch select bar (when in select mode)
@@ -1364,11 +1879,14 @@ function renderSessionListFromCache(){
   }
   // Ensure batch action bar exists in DOM
   let batchBar=$('batchActionBar');
-  if(!batchBar){batchBar=document.createElement('div');batchBar.id='batchActionBar';batchBar.className='batch-action-bar';document.body.appendChild(batchBar);}
-  if(_sessionSelectMode&&_selectedSessions.size>0){batchBar.style.display='';_renderBatchActionBar();}
+  if(!batchBar){batchBar=document.createElement('div');batchBar.id='batchActionBar';batchBar.className='batch-action-bar';}
+  list.appendChild(batchBar);
+  if(_sessionSelectMode&&_selectedSessions.size>0){batchBar.style.display='flex';_renderBatchActionBar();}
   else{batchBar.style.display='none';}
-  // Project filter bar (only when projects exist)
-  if(_allProjects.length>0){
+  // Project filter bar — show when there are real projects OR there are
+  // unassigned sessions (so the Unassigned chip has something to filter to).
+  const hasUnprojected=profileFiltered.some(s=>!s.project_id);
+  if(_allProjects.length>0||hasUnprojected){
     const bar=document.createElement('div');
     bar.className='project-bar';
     // "All" chip
@@ -1377,6 +1895,17 @@ function renderSessionListFromCache(){
     allChip.textContent='All';
     allChip.onclick=()=>{_activeProject=null;renderSessionListFromCache();};
     bar.appendChild(allChip);
+    // "Unassigned" chip — only when there are sessions with no project to
+    // filter to. Hidden in the common case where every session is already
+    // organized, to keep the chip bar uncluttered.
+    if(hasUnprojected){
+      const noneChip=document.createElement('span');
+      noneChip.className='project-chip no-project'+(_activeProject===NO_PROJECT_FILTER?' active':'');
+      noneChip.textContent='Unassigned';
+      noneChip.title='Show conversations not yet assigned to a project';
+      noneChip.onclick=()=>{_activeProject=NO_PROJECT_FILTER;renderSessionListFromCache();};
+      bar.appendChild(noneChip);
+    }
     // Project chips
     for(const p of _allProjects){
       const chip=document.createElement('span');
@@ -1435,10 +1964,10 @@ function renderSessionListFromCache(){
   if(_activeProject&&sessions.length===0){
     const empty=document.createElement('div');
     empty.style.cssText='padding:20px 14px;color:var(--muted);font-size:12px;text-align:center;opacity:.7;';
-    empty.textContent='No sessions in this project yet.';
+    empty.textContent=_activeProject===NO_PROJECT_FILTER?'No unassigned sessions.':'No sessions in this project yet.';
     list.appendChild(empty);
   }
-  const orderedSessions=[..._topLevelSessions].sort((a,b)=>_sessionTimestampMs(b)-_sessionTimestampMs(a));
+  const orderedSessions=[...sessions].sort((a,b)=>_sessionTimestampMs(b)-_sessionTimestampMs(a));
   // Separate pinned from unpinned
   const pinned=orderedSessions.filter(s=>s.pinned);
   const unpinned=orderedSessions.filter(s=>!s.pinned);
@@ -1484,47 +2013,7 @@ function renderSessionListFromCache(){
       _saveCollapsed();
     };
     wrapper.appendChild(hdr);
-    for(const s of g.items){
-      const parentEl=_renderOneSession(s, Boolean(g.isPinned));
-      body.appendChild(parentEl);
-      // Render subagent children as indented tree (#494)
-      const children=_parentChildrenMap.get(s.session_id);
-      if(children&&children.length){
-        parentEl.classList.add('session-parent');
-        const treeCaret=document.createElement('span');
-        treeCaret.className='session-tree-caret';
-        treeCaret.textContent='\u25B8'; // right-pointing triangle (collapsed)
-        treeCaret.title=t('subagent_children');
-        parentEl.querySelector('.session-title-row').prepend(treeCaret);
-        const childCount=children.length;
-        const childBadge=document.createElement('span');
-        childBadge.className='session-tree-badge';
-        childBadge.textContent=childCount;
-        childBadge.title=t('subagent_children');
-        parentEl.querySelector('.session-title-row').appendChild(childBadge);
-        const isCollapsed=_treeCollapsed[s.session_id]!==false; // collapsed by default
-        const childContainer=document.createElement('div');
-        childContainer.className='session-tree-children';
-        if(isCollapsed){childContainer.style.display='none';treeCaret.classList.add('collapsed');}
-        else{treeCaret.classList.remove('collapsed');treeCaret.textContent='\u25BE';}
-        const sortedChildren=[...children].sort((a,b)=>_sessionTimestampMs(b)-_sessionTimestampMs(a));
-        for(const child of sortedChildren){
-          const childEl=_renderOneSession(child, Boolean(g.isPinned));
-          childEl.classList.add('session-tree-child');
-          childContainer.appendChild(childEl);
-        }
-        body.appendChild(childContainer);
-        treeCaret.onclick=(e)=>{
-          e.stopPropagation();
-          const hidden=childContainer.style.display==='none';
-          childContainer.style.display=hidden?'':'none';
-          treeCaret.textContent=hidden?'\u25BE':'\u25B8';
-          treeCaret.classList.toggle('collapsed',!hidden);
-          _treeCollapsed[s.session_id]=!hidden;
-          _saveTreeCollapsed();
-        };
-      }
-    }
+    for(const s of g.items){ body.appendChild(_renderOneSession(s, Boolean(g.isPinned))); }
     wrapper.appendChild(body);
     list.appendChild(wrapper);
   }
@@ -1557,8 +2046,11 @@ function renderSessionListFromCache(){
       const cbWrapper=document.createElement('label');cbWrapper.className='session-select-cb-wrapper';
       const cb=document.createElement('input');cb.type='checkbox';cb.className='session-select-cb';
       cb.dataset.sid=s.session_id;cb.checked=_selectedSessions.has(s.session_id);
-      cb.onchange=(e)=>{e.stopPropagation();toggleSessionSelect(s.session_id);};
+      cb.onchange=(e)=>{e.stopPropagation();setSessionSelected(s.session_id,cb.checked);};
       cb.onclick=(e)=>{e.stopPropagation();};
+      cb.onpointerup=(e)=>{e.stopPropagation();};
+      cbWrapper.onpointerup=(e)=>{e.stopPropagation();};
+      cbWrapper.onclick=(e)=>{e.stopPropagation();};
       cbWrapper.appendChild(cb);
       el.classList.toggle('selected',_selectedSessions.has(s.session_id));
       el.appendChild(cbWrapper);
@@ -1577,7 +2069,7 @@ function renderSessionListFromCache(){
     if(s.parent_session_id){
       const branchInd=document.createElement('span');
       branchInd.className='session-branch-indicator';
-      branchInd.textContent='\u2482'; // ⑂
+      branchInd.textContent='\u2442'; // ⑂
       branchInd.title=(typeof t==='function'?t('forked_from'):'Forked from')+' '+s.parent_session_id;
       branchInd.style.cursor='pointer';
       branchInd.onclick=(e)=>{
@@ -1596,6 +2088,23 @@ function renderSessionListFromCache(){
     ts.className='session-time'+(hasAttentionState?' is-hidden':'');
     ts.textContent=hasAttentionState?'':_formatRelativeSessionTime(tsMs);
     titleRow.appendChild(title);
+    const childCount=typeof s._child_session_count==='number'?s._child_session_count:(Array.isArray(s._child_sessions)?s._child_sessions.length:0);
+    if(childCount>0){
+      const childCountEl=document.createElement('span');
+      childCountEl.className='session-child-count';
+      const childLabel=t('session_meta_children', childCount);
+      childCountEl.textContent=childLabel;
+      childCountEl.title=childLabel;
+      ['pointerdown','pointerup','click'].forEach(ev=>childCountEl.addEventListener(ev,e=>e.stopPropagation()));
+      childCountEl.onclick=(e)=>{
+        e.stopPropagation();
+        const key=_sidebarLineageKeyForRow(s);
+        if(_expandedChildSessionKeys.has(key)) _expandedChildSessionKeys.delete(key);
+        else _expandedChildSessionKeys.add(key);
+        renderSessionListFromCache();
+      };
+      titleRow.appendChild(childCountEl);
+    }
     // Project color dot: placed BETWEEN title and timestamp, not inside the
     // title span. Inside the title span it would be clipped by the ellipsis
     // truncation, becoming invisible exactly when the title is long enough
@@ -1621,12 +2130,41 @@ function renderSessionListFromCache(){
         ? t('session_meta_messages', msgCount)
         : `${msgCount} msg${msgCount===1?'':'s'}`;
       metaBits.push(msgLabel);
+      if(childCount>0) metaBits.push(t('session_meta_children', childCount));
       if(s.model) metaBits.push(s.model);
       if(_showAllProfiles&&s.profile) metaBits.push(s.profile);
       const meta=document.createElement('div');
       meta.className='session-meta';
       meta.textContent=metaBits.join(' · ');
       sessionText.appendChild(meta);
+    }
+    const lineageKey=_sidebarLineageKeyForRow(s);
+    if(childCount>0&&Array.isArray(s._child_sessions)&&_expandedChildSessionKeys.has(lineageKey)){
+      const childList=document.createElement('div');
+      childList.className='session-child-sessions';
+      ['pointerdown','pointerup','click'].forEach(ev=>childList.addEventListener(ev,e=>e.stopPropagation()));
+      const sortedChildren=[...s._child_sessions].sort((a,b)=>_sessionTimestampMs(b)-_sessionTimestampMs(a));
+      for(const child of sortedChildren){
+        const row=document.createElement('button');
+        row.type='button';
+        row.className='session-child-session'+(activeSidForSidebar&&child.session_id===activeSidForSidebar?' active':'');
+        const childTitle=child.title||'Untitled child session';
+        const childTime=_formatRelativeSessionTime(_sessionTimestampMs(child));
+        const parentNote=child._parent_segment_title?` via ${child._parent_segment_title}`:'';
+        row.textContent=`-> ${childTitle}${parentNote} - ${childTime}`;
+        row.title='Open child session';
+        row.onclick=async(e)=>{
+          e.stopPropagation();
+          if(child.is_cli_session){
+            try{await api('/api/session/import_cli',{method:'POST',body:JSON.stringify({session_id:child.session_id})});}
+            catch(_e){ /* read-only fallback */ }
+          }
+          await loadSession(child.session_id);
+          renderSessionListFromCache();
+        };
+        childList.appendChild(row);
+      }
+      sessionText.appendChild(childList);
     }
     // Append tag chips after the title text
     for(const tag of tags){
@@ -1644,6 +2182,9 @@ function renderSessionListFromCache(){
 
     // Rename: called directly when we confirm it's a double-click
     const startRename=()=>{
+      // Guard: prevent renaming if session is currently being loaded
+      if (_loadingSessionId && _loadingSessionId !== s.session_id) return;
+
       closeSessionActionMenu();
       _renamingSid = s.session_id;
       const oldTitle=s.title||'Untitled';
@@ -1764,6 +2305,7 @@ function renderSessionListFromCache(){
       if(e.pointerType==='mouse' && e.button!==0) return;  // ignore right/middle click
       if(_renamingSid) return;
       if(actions.contains(e.target)) return;
+      if(e.target&&e.target.closest&&e.target.closest('.session-child-count,.session-child-sessions,.session-child-session')) return;
       if(_sessionSelectMode){e.stopPropagation();toggleSessionSelect(s.session_id);return;}
       // If the pointer moved enough to be a drag, cancel any pending tap
       if(_isDragging){clearTimeout(_tapTimer);_tapTimer=null;_lastTapTime=0;_clearDragTimer=setTimeout(()=>{el.classList.remove('dragging');_clearDragTimer=null;},50);return;}
@@ -1795,6 +2337,16 @@ function renderSessionListFromCache(){
         await loadSession(s.session_id);renderSessionListFromCache();
         if(typeof closeMobileSidebar==='function')closeMobileSidebar();
       }, delay);
+    };
+    // Add ondblclick for more reliable double-click detection
+    el.ondblclick=(e)=>{
+      if(e.pointerType==='mouse' && e.button!==0) return;
+      if(_renamingSid) return;
+      if(actions.contains(e.target)) return;
+      if(_sessionSelectMode){e.stopPropagation();toggleSessionSelect(s.session_id);return;}
+      // Guard: prevent renaming if session is currently being loaded
+      if (_loadingSessionId && _loadingSessionId !== s.session_id) return;
+      startRename();
     };
     return el;
   }
@@ -1833,6 +2385,7 @@ async function deleteSession(sid){
   if(!ok)return;
   try{
     await api('/api/session/delete',{method:'POST',body:JSON.stringify({session_id:sid})});
+    _clearHandoffStorageForSession(sid);
   }catch(e){setStatus(`Delete failed: ${e.message}`);return;}
   if(S.session&&S.session.session_id===sid){
     S.session=null;S.messages=[];S.entries=[];
